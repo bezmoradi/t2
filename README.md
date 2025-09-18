@@ -20,6 +20,36 @@ Mac users need to run the following command to install the prerequisites:
 $ brew install portaudio pkg-config go
 ```
 
+### Add Go to your PATH
+
+You need to make sure Go’s binaries are available in your `PATH`. Add the following line to your shell configuration file:
+
+```sh
+export PATH=$PATH:$HOME/go/bin
+```
+
+If you use `zsh`, Add it to your `~/.zshrc` file, then apply the changes:
+
+```sh
+$ echo 'export PATH=$PATH:$HOME/go/bin' >> ~/.zshrc
+$ source ~/.zshrc
+```
+
+If you use `bash`, add it to your `~/.bash_profile` or `~/.bashrc` file, then apply the changes:
+
+```sh
+$ echo 'export PATH=$PATH:$HOME/go/bin' >> ~/.bash_profile
+$ source ~/.bash_profile
+```
+
+If you’re not sure which shell you’re using, run:
+
+```sh
+$ echo $SHELL
+```
+
+That will tell you whether you’re in `zsh`, `bash`, or another shell. Update the correct configuration file accordingly.
+
 ## Installation
 
 To install the tool, run the following command inside terminal:
@@ -93,7 +123,7 @@ $ git clone git@github.com:bezmoradi/t2.git
 Then CD into the `t2` folder and build the app:
 
 ```sh
-$ go build -o t2 ./cmd/t2/ 
+$ go build -o t2 ./cmd/t2/
 ```
 
 Finally, run the app by the following command:

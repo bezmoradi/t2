@@ -17,22 +17,25 @@ import (
 )
 
 type Daemon struct {
-	config           *config.Config
-	recorder         *audio.Recorder
-	transcriptClient *transcription.Client
-	processor        *transcription.Processor
-	hotkeyManager    *hotkeys.Manager
-	metricsManager   *metrics.MetricsManager
-	terminalControl  *terminal.Control
-	apiKey           string
-	currentTurnOrder int
-	sessionStartTime time.Time
-	isFirstSession   bool
+	config             *config.Config
+	recorder           *audio.Recorder
+	transcriptClient   *transcription.Client
+	processor          *transcription.Processor
+	hotkeyManager      *hotkeys.Manager
+	metricsManager     *metrics.MetricsManager
+	terminalControl    *terminal.Control
+	apiKey             string
+	currentTurnOrder   int
+	sessionStartTime   time.Time
+	isFirstSession     bool
+	pressTime          time.Time
+	quickPressThreshold time.Duration
 }
 
 func NewDaemon() *Daemon {
 	return &Daemon{
-		isFirstSession: true,
+		isFirstSession:      true,
+		quickPressThreshold: 800 * time.Millisecond,
 	}
 }
 
@@ -138,6 +141,11 @@ func (d *Daemon) Cleanup() {
 
 // OnPress implements hotkeys.EventHandler
 func (d *Daemon) OnPress() {
+	// Check if already recording to prevent overlapping sessions
+	if d.recorder.IsRecording() {
+		return
+	}
+
 	// Silently reconnect if needed (happens after Terminate closes the connection)
 	if !d.transcriptClient.IsConnected() {
 		if err := d.transcriptClient.Connect(d.apiKey); err != nil {
@@ -154,6 +162,9 @@ func (d *Daemon) OnPress() {
 	d.processor.Reset()
 	d.currentTurnOrder = 0
 
+	// Record press time for quick-press detection (just before starting recording)
+	d.pressTime = time.Now()
+
 	// Record session start time for metrics
 	d.sessionStartTime = time.Now()
 
@@ -162,8 +173,31 @@ func (d *Daemon) OnPress() {
 
 // OnRelease implements hotkeys.EventHandler
 func (d *Daemon) OnRelease() {
+	// Check if we're actually recording
+	if !d.recorder.IsRecording() {
+		return
+	}
+
+	// Calculate recording duration for quick-press detection
+	recordingDuration := time.Since(d.pressTime)
+
 	d.recorder.Stop()
 	audio.PlayBeep("stop")
+
+	// Layer 1: Check for quick press - skip transcription if too short
+	if recordingDuration < d.quickPressThreshold {
+		fmt.Println("⚡ Quick press detected - skipped")
+		fmt.Println()
+		return
+	}
+
+	// Layer 2: Check for silence - skip transcription if no speech detected
+	maxRMS := d.recorder.GetMaxRMS()
+	if maxRMS < 250.0 { // Balanced threshold - allows quiet speech while catching silence
+		fmt.Println("🔇 No speech detected - skipped")
+		fmt.Println()
+		return
+	}
 
 	// Send termination to transcription service
 	d.transcriptClient.Terminate()

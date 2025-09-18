@@ -20,7 +20,7 @@ func main() {
 
 %v
 
-To get the latest features and likely bugfixes, please install the latest version by running 'go install github.com/bezmoradi/t2/cmd/t2@%v'.`+"\n", newVersion, version.VERSION, version.UPDATE_MESSAGE, newVersion)
+To get the latest features and likely bugfixes, please install the latest version by running 'go install github.com/bezmoradi/t2/cmd/t2@main'.`+"\n", newVersion, version.VERSION, version.UPDATE_MESSAGE)
 		return
 	}
 

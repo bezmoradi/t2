@@ -34,7 +34,9 @@ func (p *Processor) ProcessTranscript(transcript string, turnOrder int, isComple
 	// where each partial transcript contains the complete accumulated text
 	if isComplete {
 		// Add final transcripts to our collection to handle multiple sessions
-		p.finalTranscripts = append(p.finalTranscripts, transcript)
+		// Append space to ensure proper spacing between sentences
+		transcriptWithSpace := transcript + " "
+		p.finalTranscripts = append(p.finalTranscripts, transcriptWithSpace)
 		p.lastFinalTime = time.Now() // Track when we received this final
 
 		// Build complete transcript from all final transcripts

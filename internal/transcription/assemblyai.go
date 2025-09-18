@@ -106,6 +106,15 @@ func (c *Client) SendAudio(audioData []byte) error {
 
 	// Send raw audio bytes directly (not JSON, not base64)
 	err := c.wsConn.WriteMessage(websocket.BinaryMessage, audioData)
+
+	// If we get a close error, the connection is no longer usable
+	if err != nil && (websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) ||
+		strings.Contains(err.Error(), "websocket: close sent") ||
+		strings.Contains(err.Error(), "use of closed network connection")) {
+		// Clean up the connection since it's no longer usable
+		c.wsConn = nil
+	}
+
 	return err
 }
 

@@ -20,15 +20,15 @@ Mac users need to run the following command to install the prerequisites:
 $ brew install portaudio pkg-config go
 ```
 
-### Add Go to your PATH
+### Add Go to Your PATH
 
-You need to make sure Go’s binaries are available in your `PATH`. Add the following line to your shell configuration file:
+You need to make sure Go's binaries are available in your `PATH`. Add the following line to your shell configuration file:
 
 ```sh
 export PATH=$PATH:$HOME/go/bin
 ```
 
-If you use `zsh`, Add it to your `~/.zshrc` file, then apply the changes:
+If you use `zsh`, add it to your `~/.zshrc` file, then apply the changes:
 
 ```sh
 $ echo 'export PATH=$PATH:$HOME/go/bin' >> ~/.zshrc

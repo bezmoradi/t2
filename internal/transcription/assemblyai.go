@@ -44,18 +44,18 @@ type AudioMessage struct {
 type Client struct {
 	wsConn              *websocket.Conn
 	wsMutex             sync.Mutex
-	transcriptCallback  func(string, bool) // transcript, isComplete
-	connectionCallback  func(bool)         // connected
-	terminationCallback func()             // called when session terminates
-	chunkCount          int                // for audio logging
-	lastChunkSize       int                // for audio logging
-	connectionHealth    int                // tracks connection quality (0-100)
-	lastConnectionTime  time.Time          // when connection was established
-	sessionCount        int                // number of sessions since connection
-	failedSessions      int                // consecutive failed sessions
+	transcriptCallback  func(string, bool, bool, float64) // transcript, isComplete, endOfTurn, confidence
+	connectionCallback  func(bool)                        // connected
+	terminationCallback func()                            // called when session terminates
+	chunkCount          int                               // for audio logging
+	lastChunkSize       int                               // for audio logging
+	connectionHealth    int                               // tracks connection quality (0-100)
+	lastConnectionTime  time.Time                         // when connection was established
+	sessionCount        int                               // number of sessions since connection
+	failedSessions      int                               // consecutive failed sessions
 }
 
-func NewClient(transcriptCallback func(string, bool), connectionCallback func(bool)) *Client {
+func NewClient(transcriptCallback func(string, bool, bool, float64), connectionCallback func(bool)) *Client {
 	return &Client{
 		transcriptCallback: transcriptCallback,
 		connectionCallback: connectionCallback,
@@ -288,16 +288,28 @@ func (c *Client) handleResponses() {
 						isComplete = true
 					}
 
-					// Log transcript details
+					// Extract completion indicators from AssemblyAI
+					endOfTurn := false
+					if eot, ok := baseMsg["end_of_turn"].(bool); ok {
+						endOfTurn = eot
+					}
+
+					confidence := 0.0
+					if conf, ok := baseMsg["end_of_turn_confidence"].(float64); ok {
+						confidence = conf
+					}
+
+					// Log transcript details with completion signals
 					transcriptType := "partial"
 					if isComplete {
 						transcriptType = "final"
 					}
-					log.Printf("[RECV] Transcript (%s): %d chars: \"%s\"", transcriptType, len(transcript), transcript)
+					log.Printf("[RECV] Transcript (%s): %d chars: \"%s\" | end_of_turn: %v, confidence: %.2f",
+						transcriptType, len(transcript), transcript, endOfTurn, confidence)
 
-					// Send transcript to callback
+					// Send transcript to callback with completion indicators
 					if c.transcriptCallback != nil {
-						c.transcriptCallback(transcript, isComplete)
+						c.transcriptCallback(transcript, isComplete, endOfTurn, confidence)
 					}
 				}
 

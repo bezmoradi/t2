@@ -67,8 +67,8 @@ func (d *Daemon) Initialize() error {
 	// Initialize recorder with audio callback
 	d.recorder = audio.NewRecorder(d.transcriptClient.SendAudio)
 
-	// Set up silence detection callback
-	d.recorder.SetSilenceCallback(d.handleSilenceDetected)
+	// Silence detection is now handled on key release instead of real-time callback
+	// d.recorder.SetSilenceCallback(d.handleSilenceDetected)
 
 	// Initialize hotkey manager
 	d.hotkeyManager = hotkeys.NewManager(d)
@@ -217,11 +217,24 @@ func (d *Daemon) OnRelease() {
 		return
 	}
 
-	// Layer 2: Check for silence - skip transcription if no speech detected
+	// Layer 2: Check for prolonged silence or low audio levels
 	maxRMS := d.recorder.GetMaxRMS()
-	log.Printf("[SESSION] Max RMS level: %.2f", maxRMS)
-	if maxRMS < 150.0 { // Lowered threshold - allows quiet speech while catching silence
-		log.Printf("[SESSION] Silence detected (RMS %.2f < 150.0), skipping transcription", maxRMS)
+	hadProlongedSilence := d.recorder.HasProlongedSilence()
+	log.Printf("[SESSION] Max RMS level: %.2f, prolonged silence: %v", maxRMS, hadProlongedSilence)
+
+	// Skip if we had prolonged silence without any significant speech
+	if hadProlongedSilence && maxRMS < 150.0 {
+		log.Printf("[SESSION] Prolonged silence detected with low audio (RMS %.2f < 150.0), skipping transcription", maxRMS)
+		fmt.Println("🔇 Real-time silence detected - skipped")
+		fmt.Println()
+		// Reset processor to discard any accumulated audio from this session
+		d.processor.Reset()
+		return
+	}
+
+	// Also check traditional silence detection for very quiet recordings
+	if !hadProlongedSilence && maxRMS < 150.0 {
+		log.Printf("[SESSION] Low audio level detected (RMS %.2f < 150.0), skipping transcription", maxRMS)
 		fmt.Println("🔇 No speech detected - skipped")
 		fmt.Println()
 		// Reset processor to discard any accumulated audio from this session
@@ -229,66 +242,41 @@ func (d *Daemon) OnRelease() {
 		return
 	}
 
-	log.Printf("[SESSION] Audio detected, proceeding with transcription")
+	log.Printf("[SESSION] Audio detected, using real-time streaming approach")
 
-	// Wait for complete transcription with longer timeout before terminating
-	// This allows AssemblyAI to finish processing all audio data
-	log.Printf("[SESSION] Waiting for transcription completion...")
-	waitStartTime := time.Now()
-	select {
-	case <-d.processor.WaitForComplete():
-		log.Printf("[SESSION] First completion received after %v", time.Since(waitStartTime))
-		// Got first final transcription, wait additional time for any remaining transcripts
-		log.Printf("[SESSION] Waiting for additional transcripts...")
-		additionalWaitTimer := time.NewTimer(2500 * time.Millisecond)
-		defer additionalWaitTimer.Stop()
-
-		for {
-			select {
-			case <-additionalWaitTimer.C:
-				// No more transcripts received within timeout, safe to terminate
-				log.Printf("[SESSION] Additional wait timeout, proceeding to terminate")
-				goto sendTermination
-			default:
-				// Check if we've been idle long enough (no new transcripts)
-				if d.processor.IsLikelyComplete() {
-					// Wait a bit more to be absolutely sure
-					time.Sleep(500 * time.Millisecond)
-					if d.processor.IsLikelyComplete() {
-						log.Printf("[SESSION] Transcription appears complete, proceeding to terminate")
-						goto sendTermination
-					}
-				}
-				time.Sleep(100 * time.Millisecond)
-			}
-		}
-
-	case <-time.After(8 * time.Second):
-		// Longer timeout to allow full transcription processing
-		log.Printf("[SESSION] Completion timeout after 8 seconds")
-	}
-
-sendTermination:
-	// Send termination to transcription service
-	log.Printf("[SESSION] Sending termination signal at %s", time.Now().Format("15:04:05.000"))
+	// Immediate termination for true streaming - send termination right away
+	log.Printf("[SESSION] Sending immediate termination signal at %s", time.Now().Format("15:04:05.000"))
 	d.transcriptClient.Terminate()
 
-	// Wait for session termination confirmation
-	log.Printf("[SESSION] Waiting for session termination...")
-	terminationWaitStart := time.Now()
+	// Fixed timeout for reliability + UX balance
+	log.Printf("[SESSION] Using 1s termination timeout (balanced for reliability + UX)")
+
+	// Wait for AssemblyAI termination confirmation (protocol-based approach)
+	log.Printf("[SESSION] Waiting for AssemblyAI termination confirmation...")
+	waitStartTime := time.Now()
+
+	terminationTimeout := 1 * time.Second // Balanced timeout for reliability + UX
 	select {
 	case <-d.processor.WaitForTermination():
-		log.Printf("[SESSION] Termination received after %v", time.Since(terminationWaitStart))
-	case <-time.After(3 * time.Second):
-		log.Printf("[SESSION] Termination timeout after 3 seconds")
+		log.Printf("[SESSION] Termination confirmed after %v", time.Since(waitStartTime))
+	case <-time.After(terminationTimeout):
+		log.Printf("[SESSION] Termination timeout after %.1fs, proceeding anyway", terminationTimeout.Seconds())
 	}
 
-	// Get the final transcript
-	log.Printf("[SESSION] Retrieving final transcript...")
-	text := d.processor.ConsumeTranscript()
+	// Get the final transcript or fallback to best partial
+	log.Printf("[SESSION] Retrieving transcript...")
+	text, isFinal := d.processor.ConsumeTranscriptWithFallback()
+
+	// Guarantee clean state for next session (prevents cross-session contamination)
+	log.Printf("[SESSION] Ensuring clean processor state for next session")
+	d.processor.Reset()
 
 	if text != "" {
-		log.Printf("[SESSION] SUCCESS: Final transcript length: %d chars", len(text))
+		transcriptType := "final"
+		if !isFinal {
+			transcriptType = "partial fallback"
+		}
+		log.Printf("[SESSION] SUCCESS: %s transcript length: %d chars", transcriptType, len(text))
 		if err := clipboard.PasteTextSafely(text); err != nil {
 			log.Printf("[SESSION] ERROR: Paste failed: %v", err)
 			fmt.Printf("❌ Paste failed: %v\n", err)
@@ -310,13 +298,13 @@ sendTermination:
 }
 
 // handleTranscript handles incoming transcripts from the transcription client
-func (d *Daemon) handleTranscript(transcript string, isComplete bool) {
+func (d *Daemon) handleTranscript(transcript string, isComplete bool, endOfTurn bool, confidence float64) {
 	// AssemblyAI sends progressive partial transcripts that already contain
 	// the accumulated text, so we use the same turn order (0) for all partials
 	// and only mark completion when we get the final formatted transcript
 
 	turnOrder := 0
-	d.processor.ProcessTranscript(transcript, turnOrder, isComplete)
+	d.processor.ProcessTranscript(transcript, turnOrder, isComplete, endOfTurn, confidence)
 }
 
 // handleConnection handles connection status changes

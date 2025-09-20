@@ -15,6 +15,14 @@ const (
 	Frames     = 1024
 )
 
+// SpeechState represents the current state of speech detection
+type SpeechState int
+
+const (
+	WaitingForSpeech SpeechState = iota // Waiting for initial speech - aggressive silence detection
+	SpeechDetected                      // Speech has been detected - disable silence cutoff
+)
+
 type Recorder struct {
 	recording        bool
 	stream           *portaudio.Stream
@@ -27,7 +35,8 @@ type Recorder struct {
 	silenceThreshold float64
 	silenceChunks    int                 // Count of consecutive silent chunks
 	maxSilenceChunks int                 // Max silent chunks before triggering callback
-	recordingStarted bool                // Track if we've detected speech yet
+	speechState      SpeechState         // Track current speech detection state
+	prolongedSilence bool                // Flag to track if we've had prolonged silence without speech
 }
 
 func NewRecorder(audioCallback func([]byte) error) *Recorder {
@@ -58,6 +67,12 @@ func (r *Recorder) GetMaxRMS() float64 {
 	return r.maxRMS
 }
 
+func (r *Recorder) HasProlongedSilence() bool {
+	r.recordingMutex.Lock()
+	defer r.recordingMutex.Unlock()
+	return r.prolongedSilence
+}
+
 // calculateRMS computes the Root Mean Square of int16 audio samples
 func calculateRMS(samples []int16) float64 {
 	if len(samples) == 0 {
@@ -86,7 +101,8 @@ func (r *Recorder) Start() error {
 
 	// Reset silence detection for new session
 	r.silenceChunks = 0
-	r.recordingStarted = false
+	r.speechState = WaitingForSpeech
+	r.prolongedSilence = false
 
 	// Create new stop channel for this session
 	r.stopChan = make(chan struct{})
@@ -219,25 +235,26 @@ func (r *Recorder) audioStreamLoop(in []int32) {
 			r.silenceChunks++
 			log.Printf("[AUDIO] Silent chunk #%d (RMS: %.2f)", r.silenceChunks, chunkRMS)
 		} else {
-			// Speech detected - reset silence counter and mark recording as started
+			// Speech detected - reset silence counter and update state
 			if r.silenceChunks > 0 {
 				log.Printf("[AUDIO] Speech detected (RMS: %.2f), resetting silence counter", chunkRMS)
 			}
 			r.silenceChunks = 0
-			r.recordingStarted = true
+
+			// Transition from WaitingForSpeech to SpeechDetected
+			if r.speechState == WaitingForSpeech {
+				r.speechState = SpeechDetected
+				log.Printf("[AUDIO] Speech state changed: WaitingForSpeech -> SpeechDetected")
+			}
 		}
 
-		// Check if we've been silent too long after speech started
-		if r.recordingStarted && r.silenceChunks >= r.maxSilenceChunks {
-			log.Printf("[AUDIO] Real-time silence detected: %d silent chunks", r.silenceChunks)
-			silenceCallback := r.silenceCallback
-			r.recordingMutex.Unlock()
-
-			// Call silence callback if set
-			if silenceCallback != nil {
-				go silenceCallback() // Non-blocking call
+		// Mark prolonged silence but don't stop recording yet
+		// Let user decide when to release keys
+		if r.speechState == WaitingForSpeech && r.silenceChunks >= r.maxSilenceChunks {
+			if !r.prolongedSilence {
+				log.Printf("[AUDIO] Prolonged silence detected (%d silent chunks), continuing to monitor until release", r.silenceChunks)
+				r.prolongedSilence = true
 			}
-			return
 		}
 		r.recordingMutex.Unlock()
 
@@ -248,9 +265,13 @@ func (r *Recorder) audioStreamLoop(in []int32) {
 		default:
 		}
 
-		// Always send audio during recording to avoid losing quiet speech
-		// The threshold was causing loss of quiet speech at the beginning
-		if r.audioCallback != nil {
+		// Only send audio to API if speech has been detected or we haven't hit prolonged silence yet
+		// This avoids unnecessary API calls during prolonged silence periods
+		r.recordingMutex.Lock()
+		shouldSendAudio := r.speechState == SpeechDetected || !r.prolongedSilence
+		r.recordingMutex.Unlock()
+
+		if r.audioCallback != nil && shouldSendAudio {
 			// Send audio chunk to callback
 			if err := r.audioCallback(pcmBytes); err != nil {
 				// Check if stop was called before logging error

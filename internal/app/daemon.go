@@ -193,9 +193,11 @@ func (d *Daemon) OnRelease() {
 
 	// Layer 2: Check for silence - skip transcription if no speech detected
 	maxRMS := d.recorder.GetMaxRMS()
-	if maxRMS < 250.0 { // Balanced threshold - allows quiet speech while catching silence
+	if maxRMS < 150.0 { // Lowered threshold - allows quiet speech while catching silence
 		fmt.Println("🔇 No speech detected - skipped")
 		fmt.Println()
+		// Reset processor to discard any accumulated audio from this session
+		d.processor.Reset()
 		return
 	}
 

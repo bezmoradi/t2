@@ -84,7 +84,7 @@ AssemblyAI API key not found.
 ## Usage
 
 1. **Start**: Run `t2`
-2. **Record**: Hold "Fn + F1" key to start recording
+2. **Record**: Hold "Ctrl + Shift" key to start recording
 3. **Speak**: Talk into your microphone
 4. **Stop**: Release the keys to stop recording
 5. **Wait**: AI processes your audio (shows progress)

@@ -2,6 +2,7 @@ package app
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"os/signal"
 	"syscall"
@@ -65,6 +66,9 @@ func (d *Daemon) Initialize() error {
 
 	// Initialize recorder with audio callback
 	d.recorder = audio.NewRecorder(d.transcriptClient.SendAudio)
+
+	// Set up silence detection callback
+	d.recorder.SetSilenceCallback(d.handleSilenceDetected)
 
 	// Initialize hotkey manager
 	d.hotkeyManager = hotkeys.NewManager(d)
@@ -141,19 +145,34 @@ func (d *Daemon) Cleanup() {
 
 // OnPress implements hotkeys.EventHandler
 func (d *Daemon) OnPress() {
+	log.Printf("[SESSION] ===== RECORDING START =====")
+	log.Printf("[SESSION] Press detected at %s", time.Now().Format("15:04:05.000"))
+
 	// Check if already recording to prevent overlapping sessions
 	if d.recorder.IsRecording() {
+		log.Printf("[SESSION] Already recording, ignoring press")
 		return
+	}
+
+	// Check if connection needs refresh due to degradation
+	if d.transcriptClient.ConnectionNeedsRefresh() {
+		log.Printf("[SESSION] Connection degraded, forcing refresh")
+		d.transcriptClient.Close()
+		time.Sleep(100 * time.Millisecond)
 	}
 
 	// Silently reconnect if needed (happens after Terminate closes the connection)
 	if !d.transcriptClient.IsConnected() {
+		log.Printf("[SESSION] Reconnecting to AssemblyAI...")
 		if err := d.transcriptClient.Connect(d.apiKey); err != nil {
+			log.Printf("[SESSION] ERROR: Reconnection failed: %v", err)
 			fmt.Printf("❌ Connection failed: %v\n", err)
+			d.transcriptClient.ReportSessionFailure()
 			return
 		}
 		// Brief pause to let connection establish
 		time.Sleep(150 * time.Millisecond)
+		log.Printf("[SESSION] Reconnection successful")
 	}
 
 	audio.PlayBeep("start")
@@ -168,24 +187,31 @@ func (d *Daemon) OnPress() {
 	// Record session start time for metrics
 	d.sessionStartTime = time.Now()
 
+	log.Printf("[SESSION] Starting recording at %s", d.sessionStartTime.Format("15:04:05.000"))
 	d.recorder.Start()
 }
 
 // OnRelease implements hotkeys.EventHandler
 func (d *Daemon) OnRelease() {
+	log.Printf("[SESSION] ===== RECORDING STOP =====")
+	log.Printf("[SESSION] Release detected at %s", time.Now().Format("15:04:05.000"))
+
 	// Check if we're actually recording
 	if !d.recorder.IsRecording() {
+		log.Printf("[SESSION] Not recording, ignoring release")
 		return
 	}
 
 	// Calculate recording duration for quick-press detection
 	recordingDuration := time.Since(d.pressTime)
+	log.Printf("[SESSION] Recording duration: %v", recordingDuration)
 
 	d.recorder.Stop()
 	audio.PlayBeep("stop")
 
 	// Layer 1: Check for quick press - skip transcription if too short
 	if recordingDuration < d.quickPressThreshold {
+		log.Printf("[SESSION] Quick press detected (%v < %v), skipping transcription", recordingDuration, d.quickPressThreshold)
 		fmt.Println("⚡ Quick press detected - skipped")
 		fmt.Println()
 		return
@@ -193,7 +219,9 @@ func (d *Daemon) OnRelease() {
 
 	// Layer 2: Check for silence - skip transcription if no speech detected
 	maxRMS := d.recorder.GetMaxRMS()
+	log.Printf("[SESSION] Max RMS level: %.2f", maxRMS)
 	if maxRMS < 150.0 { // Lowered threshold - allows quiet speech while catching silence
+		log.Printf("[SESSION] Silence detected (RMS %.2f < 150.0), skipping transcription", maxRMS)
 		fmt.Println("🔇 No speech detected - skipped")
 		fmt.Println()
 		// Reset processor to discard any accumulated audio from this session
@@ -201,36 +229,84 @@ func (d *Daemon) OnRelease() {
 		return
 	}
 
-	// Send termination to transcription service
-	d.transcriptClient.Terminate()
+	log.Printf("[SESSION] Audio detected, proceeding with transcription")
 
-	// Wait for complete transcription with timeout
+	// Wait for complete transcription with longer timeout before terminating
+	// This allows AssemblyAI to finish processing all audio data
+	log.Printf("[SESSION] Waiting for transcription completion...")
+	waitStartTime := time.Now()
 	select {
 	case <-d.processor.WaitForComplete():
-		// Got first final transcription, now wait for session termination
-		select {
-		case <-d.processor.WaitForTermination():
-		case <-time.After(3 * time.Second):
+		log.Printf("[SESSION] First completion received after %v", time.Since(waitStartTime))
+		// Got first final transcription, wait additional time for any remaining transcripts
+		log.Printf("[SESSION] Waiting for additional transcripts...")
+		additionalWaitTimer := time.NewTimer(2500 * time.Millisecond)
+		defer additionalWaitTimer.Stop()
+
+		for {
+			select {
+			case <-additionalWaitTimer.C:
+				// No more transcripts received within timeout, safe to terminate
+				log.Printf("[SESSION] Additional wait timeout, proceeding to terminate")
+				goto sendTermination
+			default:
+				// Check if we've been idle long enough (no new transcripts)
+				if d.processor.IsLikelyComplete() {
+					// Wait a bit more to be absolutely sure
+					time.Sleep(500 * time.Millisecond)
+					if d.processor.IsLikelyComplete() {
+						log.Printf("[SESSION] Transcription appears complete, proceeding to terminate")
+						goto sendTermination
+					}
+				}
+				time.Sleep(100 * time.Millisecond)
+			}
 		}
 
-	case <-time.After(5 * time.Second):
-		// Timeout after 5 seconds
+	case <-time.After(8 * time.Second):
+		// Longer timeout to allow full transcription processing
+		log.Printf("[SESSION] Completion timeout after 8 seconds")
+	}
+
+sendTermination:
+	// Send termination to transcription service
+	log.Printf("[SESSION] Sending termination signal at %s", time.Now().Format("15:04:05.000"))
+	d.transcriptClient.Terminate()
+
+	// Wait for session termination confirmation
+	log.Printf("[SESSION] Waiting for session termination...")
+	terminationWaitStart := time.Now()
+	select {
+	case <-d.processor.WaitForTermination():
+		log.Printf("[SESSION] Termination received after %v", time.Since(terminationWaitStart))
+	case <-time.After(3 * time.Second):
+		log.Printf("[SESSION] Termination timeout after 3 seconds")
 	}
 
 	// Get the final transcript
+	log.Printf("[SESSION] Retrieving final transcript...")
 	text := d.processor.ConsumeTranscript()
 
 	if text != "" {
+		log.Printf("[SESSION] SUCCESS: Final transcript length: %d chars", len(text))
 		if err := clipboard.PasteTextSafely(text); err != nil {
+			log.Printf("[SESSION] ERROR: Paste failed: %v", err)
 			fmt.Printf("❌ Paste failed: %v\n", err)
 		} else {
+			log.Printf("[SESSION] Text pasted successfully")
 			// Record metrics and display enhanced output
 			d.displaySessionMetrics(text)
+			// Report successful session to improve connection health
+			d.transcriptClient.ReportSessionSuccess()
 		}
 	} else {
+		log.Printf("[SESSION] ERROR: No transcription received")
 		fmt.Println("❌ No transcription received")
+		// Report failed session to degrade connection health
+		d.transcriptClient.ReportSessionFailure()
 	}
 	fmt.Println()
+	log.Printf("[SESSION] ===== SESSION COMPLETE =====")
 }
 
 // handleTranscript handles incoming transcripts from the transcription client
@@ -252,6 +328,28 @@ func (d *Daemon) handleConnection(connected bool) {
 // handleTermination handles session termination from AssemblyAI
 func (d *Daemon) handleTermination() {
 	d.processor.SignalTermination()
+}
+
+// handleSilenceDetected handles real-time silence detection from audio recorder
+func (d *Daemon) handleSilenceDetected() {
+	log.Printf("[SESSION] Real-time silence detected by audio recorder")
+
+	// Check if we're actually recording to prevent race conditions
+	if !d.recorder.IsRecording() {
+		log.Printf("[SESSION] Silence detected but not recording, ignoring")
+		return
+	}
+
+	// Stop recording immediately
+	log.Printf("[SESSION] Stopping recording due to real-time silence detection")
+	d.recorder.Stop()
+	audio.PlayBeep("stop")
+
+	// Log the session as skipped due to silence
+	log.Printf("[SESSION] Real-time silence skipped")
+	fmt.Println("🔇 Real-time silence detected - skipped")
+	fmt.Println()
+	log.Printf("[SESSION] ===== SESSION COMPLETE =====")
 }
 
 func (d *Daemon) displaySessionMetrics(text string) {

@@ -20,18 +20,30 @@ type Recorder struct {
 	stream           *portaudio.Stream
 	recordingMutex   sync.Mutex
 	audioCallback    func([]byte) error
+	silenceCallback  func()              // Called when silence is detected
 	stopChan         chan struct{}
 	streamWg         sync.WaitGroup
 	maxRMS           float64
 	silenceThreshold float64
+	silenceChunks    int                 // Count of consecutive silent chunks
+	maxSilenceChunks int                 // Max silent chunks before triggering callback
+	recordingStarted bool                // Track if we've detected speech yet
 }
 
 func NewRecorder(audioCallback func([]byte) error) *Recorder {
 	return &Recorder{
 		audioCallback:    audioCallback,
 		stopChan:         make(chan struct{}),
-		silenceThreshold: 250.0, // Balanced threshold for int16 samples - allows quiet speech
+		silenceThreshold: 150.0, // Threshold for silence detection (lowered to match daemon)
+		maxSilenceChunks: 20,     // ~500ms of silence at 40ms chunks (20*25ms per chunk)
 	}
+}
+
+// SetSilenceCallback sets the callback function for silence detection
+func (r *Recorder) SetSilenceCallback(callback func()) {
+	r.recordingMutex.Lock()
+	defer r.recordingMutex.Unlock()
+	r.silenceCallback = callback
 }
 
 func (r *Recorder) IsRecording() bool {
@@ -71,6 +83,10 @@ func (r *Recorder) Start() error {
 
 	// Reset audio level tracking for new session
 	r.maxRMS = 0.0
+
+	// Reset silence detection for new session
+	r.silenceChunks = 0
+	r.recordingStarted = false
 
 	// Create new stop channel for this session
 	r.stopChan = make(chan struct{})
@@ -195,6 +211,33 @@ func (r *Recorder) audioStreamLoop(in []int32) {
 		r.recordingMutex.Lock()
 		if chunkRMS > r.maxRMS {
 			r.maxRMS = chunkRMS
+		}
+
+		// Real-time silence detection
+		isSilent := chunkRMS < r.silenceThreshold
+		if isSilent {
+			r.silenceChunks++
+			log.Printf("[AUDIO] Silent chunk #%d (RMS: %.2f)", r.silenceChunks, chunkRMS)
+		} else {
+			// Speech detected - reset silence counter and mark recording as started
+			if r.silenceChunks > 0 {
+				log.Printf("[AUDIO] Speech detected (RMS: %.2f), resetting silence counter", chunkRMS)
+			}
+			r.silenceChunks = 0
+			r.recordingStarted = true
+		}
+
+		// Check if we've been silent too long after speech started
+		if r.recordingStarted && r.silenceChunks >= r.maxSilenceChunks {
+			log.Printf("[AUDIO] Real-time silence detected: %d silent chunks", r.silenceChunks)
+			silenceCallback := r.silenceCallback
+			r.recordingMutex.Unlock()
+
+			// Call silence callback if set
+			if silenceCallback != nil {
+				go silenceCallback() // Non-blocking call
+			}
+			return
 		}
 		r.recordingMutex.Unlock()
 

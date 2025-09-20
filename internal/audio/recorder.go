@@ -233,18 +233,13 @@ func (r *Recorder) audioStreamLoop(in []int32) {
 		isSilent := chunkRMS < r.silenceThreshold
 		if isSilent {
 			r.silenceChunks++
-			log.Printf("[AUDIO] Silent chunk #%d (RMS: %.2f)", r.silenceChunks, chunkRMS)
 		} else {
 			// Speech detected - reset silence counter and update state
-			if r.silenceChunks > 0 {
-				log.Printf("[AUDIO] Speech detected (RMS: %.2f), resetting silence counter", chunkRMS)
-			}
 			r.silenceChunks = 0
 
 			// Transition from WaitingForSpeech to SpeechDetected
 			if r.speechState == WaitingForSpeech {
 				r.speechState = SpeechDetected
-				log.Printf("[AUDIO] Speech state changed: WaitingForSpeech -> SpeechDetected")
 			}
 		}
 
@@ -252,7 +247,6 @@ func (r *Recorder) audioStreamLoop(in []int32) {
 		// Let user decide when to release keys
 		if r.speechState == WaitingForSpeech && r.silenceChunks >= r.maxSilenceChunks {
 			if !r.prolongedSilence {
-				log.Printf("[AUDIO] Prolonged silence detected (%d silent chunks), continuing to monitor until release", r.silenceChunks)
 				r.prolongedSilence = true
 			}
 		}

@@ -3,7 +3,6 @@ package transcription
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/url"
 	"strings"
 	"sync"
@@ -68,12 +67,10 @@ func (c *Client) SetTerminationCallback(callback func()) {
 }
 
 func (c *Client) Connect(apiKey string) error {
-	log.Printf("[WS] Starting connection to AssemblyAI at %s", time.Now().Format("15:04:05.000"))
 
 	// Create WebSocket URL with query parameters (matching JS example)
 	u, err := url.Parse(assemblyAIStreamURL)
 	if err != nil {
-		log.Printf("[WS] ERROR: Failed to parse WebSocket URL: %v", err)
 		return fmt.Errorf("error parsing WebSocket URL: %v", err)
 	}
 
@@ -87,7 +84,6 @@ func (c *Client) Connect(apiKey string) error {
 	headers := make(map[string][]string)
 	headers["Authorization"] = []string{apiKey}
 
-	log.Printf("[WS] Attempting connection to: %s", u.String())
 
 	// Establish WebSocket connection
 	c.wsMutex.Lock()
@@ -95,11 +91,9 @@ func (c *Client) Connect(apiKey string) error {
 	c.wsMutex.Unlock()
 
 	if err != nil {
-		log.Printf("[WS] ERROR: Connection failed: %v", err)
 		return fmt.Errorf("error connecting to AssemblyAI: %v", err)
 	}
 
-	log.Printf("[WS] SUCCESS: Connected successfully at %s", time.Now().Format("15:04:05.000"))
 
 	// Update connection health tracking
 	c.lastConnectionTime = time.Now()
@@ -123,32 +117,20 @@ func (c *Client) SendAudio(audioData []byte) error {
 	defer c.wsMutex.Unlock()
 
 	if c.wsConn == nil {
-		log.Printf("[AUDIO] ERROR: WebSocket connection not established")
 		return fmt.Errorf("WebSocket connection not established")
 	}
 
-	// Log audio chunk details (reduce frequency to avoid spam)
-	// Only log every 50th chunk or when chunk size changes
 	c.chunkCount++
-
-	if c.chunkCount%50 == 1 || len(audioData) != c.lastChunkSize {
-		log.Printf("[AUDIO] Sending chunk #%d, size: %d bytes", c.chunkCount, len(audioData))
-		c.lastChunkSize = len(audioData)
-	}
 
 	// Send raw audio bytes directly (not JSON, not base64)
 	err := c.wsConn.WriteMessage(websocket.BinaryMessage, audioData)
 
-	if err != nil {
-		log.Printf("[AUDIO] ERROR: Failed to send audio chunk: %v", err)
-	}
 
 	// If we get a close error, the connection is no longer usable
 	if err != nil && (websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) ||
 		strings.Contains(err.Error(), "websocket: close sent") ||
 		strings.Contains(err.Error(), "use of closed network connection")) {
 		// Clean up the connection since it's no longer usable
-		log.Printf("[AUDIO] Connection closed, cleaning up WebSocket")
 		c.wsConn = nil
 	}
 
@@ -159,24 +141,16 @@ func (c *Client) Terminate() error {
 	c.wsMutex.Lock()
 	defer c.wsMutex.Unlock()
 
-	log.Printf("[WS] Sending termination signal at %s", time.Now().Format("15:04:05.000"))
 
 	if c.wsConn != nil {
 		// Send termination message to AssemblyAI (like Python example)
 		terminateMessage := map[string]string{"type": "Terminate"}
 		if jsonData, err := json.Marshal(terminateMessage); err == nil {
 			err = c.wsConn.WriteMessage(websocket.TextMessage, jsonData)
-			if err != nil {
-				log.Printf("[WS] ERROR: Failed to send termination message: %v", err)
-			} else {
-				log.Printf("[WS] Termination message sent successfully")
-			}
 		} else {
-			log.Printf("[WS] ERROR: Failed to marshal termination message: %v", err)
-		}
+			}
 	} else {
-		log.Printf("[WS] WARNING: Attempted to terminate null connection")
-	}
+		}
 	return nil
 }
 
@@ -184,19 +158,12 @@ func (c *Client) Close() {
 	c.wsMutex.Lock()
 	defer c.wsMutex.Unlock()
 
-	log.Printf("[WS] Closing connection at %s", time.Now().Format("15:04:05.000"))
 
 	if c.wsConn != nil {
 		// Send close frame to AssemblyAI before closing
-		err := c.wsConn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
-		if err != nil {
-			log.Printf("[WS] ERROR: Failed to send close message: %v", err)
-		}
+		c.wsConn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
 		c.wsConn.Close()
 		c.wsConn = nil
-		log.Printf("[WS] Connection closed and cleaned up")
-	} else {
-		log.Printf("[WS] WARNING: Attempted to close null connection")
 	}
 
 	// Reset chunk counters for next session
@@ -214,7 +181,6 @@ func (c *Client) IsConnected() bool {
 	defer c.wsMutex.Unlock()
 
 	if c.wsConn == nil {
-		log.Printf("[WS] Connection check: null connection")
 		return false
 	}
 
@@ -223,50 +189,41 @@ func (c *Client) IsConnected() bool {
 	err := c.wsConn.WriteMessage(websocket.PingMessage, []byte{})
 	if err != nil {
 		// Connection is dead, clean it up
-		log.Printf("[WS] Connection check failed, cleaning up: %v", err)
 		c.wsConn.Close()
 		c.wsConn = nil
 		c.connectionHealth = 0
 		return false
 	}
-	log.Printf("[WS] Connection check: healthy")
 	return true
 }
 
 func (c *Client) handleResponses() {
-	log.Printf("[WS] Starting response handler goroutine")
 	for {
 		c.wsMutex.Lock()
 		conn := c.wsConn
 		c.wsMutex.Unlock()
 
 		if conn == nil {
-			log.Printf("[WS] Response handler exiting: null connection")
 			break
 		}
 
 		_, message, err := conn.ReadMessage()
 		if err != nil {
 			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
-				log.Printf("[WS] Response handler exiting: connection closed normally")
 				return
 			}
 			// Suppress network connection closed errors during shutdown
 			if strings.Contains(err.Error(), "use of closed network connection") ||
 				strings.Contains(err.Error(), "connection reset by peer") {
-				log.Printf("[WS] Response handler exiting: network error during shutdown")
 				return
 			}
-			log.Printf("[WS] ERROR: Response handler error: %v", err)
 			return
 		}
 
-		log.Printf("[RECV] Message received, size: %d bytes", len(message))
 
 		// Parse the message
 		var baseMsg map[string]any
 		if err := json.Unmarshal(message, &baseMsg); err != nil {
-			log.Printf("[RECV] ERROR: Failed to parse message: %v", err)
 			continue
 		}
 
@@ -274,11 +231,6 @@ func (c *Client) handleResponses() {
 		if msgType, ok := baseMsg["type"].(string); ok {
 			switch msgType {
 			case "Begin":
-				if sessionId, ok := baseMsg["id"].(string); ok {
-					log.Printf("[RECV] Session began: %s", sessionId)
-				} else {
-					log.Printf("[RECV] Session began (no ID)")
-				}
 
 			case "Turn":
 				if transcript, ok := baseMsg["transcript"].(string); ok && transcript != "" {
@@ -299,13 +251,6 @@ func (c *Client) handleResponses() {
 						confidence = conf
 					}
 
-					// Log transcript details with completion signals
-					transcriptType := "partial"
-					if isComplete {
-						transcriptType = "final"
-					}
-					log.Printf("[RECV] Transcript (%s): %d chars: \"%s\" | end_of_turn: %v, confidence: %.2f",
-						transcriptType, len(transcript), transcript, endOfTurn, confidence)
 
 					// Send transcript to callback with completion indicators
 					if c.transcriptCallback != nil {
@@ -314,19 +259,15 @@ func (c *Client) handleResponses() {
 				}
 
 			case "Termination":
-				log.Printf("[RECV] Session termination received")
 				if c.terminationCallback != nil {
 					c.terminationCallback()
 				}
 
 			default:
-				log.Printf("[RECV] Unknown message type: %s", msgType)
 			}
 		} else {
-			log.Printf("[RECV] Message without type field")
-		}
+			}
 	}
-	log.Printf("[WS] Response handler goroutine ended")
 }
 
 // ConnectionNeedsRefresh returns true if connection should be refreshed due to degradation

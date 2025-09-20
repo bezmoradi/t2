@@ -1,7 +1,6 @@
 package transcription
 
 import (
-	"log"
 	"sync"
 )
 
@@ -31,12 +30,6 @@ func (p *Processor) ProcessTranscript(transcript string, turnOrder int, isComple
 	p.transcriptMutex.Lock()
 	defer p.transcriptMutex.Unlock()
 
-	transcriptType := "partial"
-	if isComplete {
-		transcriptType = "final"
-	}
-	log.Printf("[PROC] Processing %s transcript (turn %d): %d chars: \"%s\" | end_of_turn: %v, confidence: %.2f",
-		transcriptType, turnOrder, len(transcript), transcript, endOfTurn, confidence)
 
 	// For streaming transcription, AssemblyAI sends progressive updates
 	// where each partial transcript contains the complete accumulated text
@@ -46,7 +39,6 @@ func (p *Processor) ProcessTranscript(transcript string, turnOrder int, isComple
 		transcriptWithSpace := transcript + " "
 		p.finalTranscripts = append(p.finalTranscripts, transcriptWithSpace)
 
-		log.Printf("[PROC] Added final transcript #%d, total finals: %d", len(p.finalTranscripts), len(p.finalTranscripts))
 
 		// Build complete transcript from all final transcripts
 		completeText := ""
@@ -58,21 +50,16 @@ func (p *Processor) ProcessTranscript(transcript string, turnOrder int, isComple
 		}
 		p.currentTranscript = completeText
 
-		log.Printf("[PROC] Complete accumulated text: %d chars: \"%s\"", len(p.currentTranscript), p.currentTranscript)
 
 		// No completion signaling - rely on termination protocol instead
-		log.Printf("[PROC] Final transcript #%d accumulated (total: %d), waiting for termination signal",
-			len(p.finalTranscripts), len(p.finalTranscripts))
 	} else {
 		// For partial transcripts, just update current (will be overwritten by final)
-		log.Printf("[PROC] Updated partial transcript: %d chars", len(transcript))
 		p.currentTranscript = transcript
 
 		// Track best partial transcript as fallback
 		if confidence > p.bestPartialConfidence || len(transcript) > len(p.bestPartialTranscript) {
 			p.bestPartialTranscript = transcript
 			p.bestPartialConfidence = confidence
-			log.Printf("[PROC] New best partial: %d chars, confidence: %.2f", len(transcript), confidence)
 		}
 	}
 
@@ -94,7 +81,6 @@ func (p *Processor) Reset() {
 	p.transcriptMutex.Lock()
 	defer p.transcriptMutex.Unlock()
 
-	log.Printf("[PROC] Resetting processor state")
 	p.currentTranscript = ""
 	p.lastTurnOrder = -1
 	p.turnTranscripts = make(map[int]string)
@@ -116,7 +102,6 @@ func (p *Processor) WaitForTermination() chan bool {
 }
 
 func (p *Processor) SignalTermination() {
-	log.Printf("[PROC] Signaling session termination")
 	select {
 	case p.sessionTerminated <- true:
 	default:
@@ -149,8 +134,6 @@ func (p *Processor) ConsumeTranscript() string {
 	defer p.transcriptMutex.Unlock()
 
 	text := p.currentTranscript
-	log.Printf("[PROC] ConsumeTranscript: returning %d chars: \"%s\"", len(text), text)
-	log.Printf("[PROC] Had %d final transcripts total", len(p.finalTranscripts))
 
 	// Mark session as inactive to prevent contamination
 	p.sessionActive = false
@@ -175,17 +158,12 @@ func (p *Processor) ConsumeTranscriptWithFallback() (string, bool) {
 	if isFinal {
 		// Use final transcript
 		text = p.currentTranscript
-		log.Printf("[PROC] ConsumeTranscriptWithFallback: returning final transcript: %d chars: \"%s\"", len(text), text)
-		log.Printf("[PROC] Had %d final transcripts total", len(p.finalTranscripts))
 	} else if len(p.bestPartialTranscript) > 0 {
 		// Use best partial as fallback
 		text = p.bestPartialTranscript + " " // Add space for consistency
-		log.Printf("[PROC] ConsumeTranscriptWithFallback: using best partial fallback: %d chars: \"%s\" (confidence: %.2f)",
-			len(text), text, p.bestPartialConfidence)
 	} else {
 		// No transcript available
 		text = ""
-		log.Printf("[PROC] ConsumeTranscriptWithFallback: no transcript available")
 	}
 
 	// Mark session as inactive to prevent contamination

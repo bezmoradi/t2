@@ -145,34 +145,27 @@ func (d *Daemon) Cleanup() {
 
 // OnPress implements hotkeys.EventHandler
 func (d *Daemon) OnPress() {
-	log.Printf("[SESSION] ===== RECORDING START =====")
-	log.Printf("[SESSION] Press detected at %s", time.Now().Format("15:04:05.000"))
 
 	// Check if already recording to prevent overlapping sessions
 	if d.recorder.IsRecording() {
-		log.Printf("[SESSION] Already recording, ignoring press")
 		return
 	}
 
 	// Check if connection needs refresh due to degradation
 	if d.transcriptClient.ConnectionNeedsRefresh() {
-		log.Printf("[SESSION] Connection degraded, forcing refresh")
 		d.transcriptClient.Close()
 		time.Sleep(100 * time.Millisecond)
 	}
 
 	// Silently reconnect if needed (happens after Terminate closes the connection)
 	if !d.transcriptClient.IsConnected() {
-		log.Printf("[SESSION] Reconnecting to AssemblyAI...")
 		if err := d.transcriptClient.Connect(d.apiKey); err != nil {
-			log.Printf("[SESSION] ERROR: Reconnection failed: %v", err)
 			fmt.Printf("❌ Connection failed: %v\n", err)
 			d.transcriptClient.ReportSessionFailure()
 			return
 		}
 		// Brief pause to let connection establish
 		time.Sleep(150 * time.Millisecond)
-		log.Printf("[SESSION] Reconnection successful")
 	}
 
 	audio.PlayBeep("start")
@@ -187,31 +180,25 @@ func (d *Daemon) OnPress() {
 	// Record session start time for metrics
 	d.sessionStartTime = time.Now()
 
-	log.Printf("[SESSION] Starting recording at %s", d.sessionStartTime.Format("15:04:05.000"))
 	d.recorder.Start()
 }
 
 // OnRelease implements hotkeys.EventHandler
 func (d *Daemon) OnRelease() {
-	log.Printf("[SESSION] ===== RECORDING STOP =====")
-	log.Printf("[SESSION] Release detected at %s", time.Now().Format("15:04:05.000"))
 
 	// Check if we're actually recording
 	if !d.recorder.IsRecording() {
-		log.Printf("[SESSION] Not recording, ignoring release")
 		return
 	}
 
 	// Calculate recording duration for quick-press detection
 	recordingDuration := time.Since(d.pressTime)
-	log.Printf("[SESSION] Recording duration: %v", recordingDuration)
 
 	d.recorder.Stop()
 	audio.PlayBeep("stop")
 
 	// Layer 1: Check for quick press - skip transcription if too short
 	if recordingDuration < d.quickPressThreshold {
-		log.Printf("[SESSION] Quick press detected (%v < %v), skipping transcription", recordingDuration, d.quickPressThreshold)
 		fmt.Println("⚡ Quick press detected - skipped")
 		fmt.Println()
 		return
@@ -220,11 +207,9 @@ func (d *Daemon) OnRelease() {
 	// Layer 2: Check for prolonged silence or low audio levels
 	maxRMS := d.recorder.GetMaxRMS()
 	hadProlongedSilence := d.recorder.HasProlongedSilence()
-	log.Printf("[SESSION] Max RMS level: %.2f, prolonged silence: %v", maxRMS, hadProlongedSilence)
 
 	// Skip if we had prolonged silence without any significant speech
 	if hadProlongedSilence && maxRMS < 150.0 {
-		log.Printf("[SESSION] Prolonged silence detected with low audio (RMS %.2f < 150.0), skipping transcription", maxRMS)
 		fmt.Println("🔇 Real-time silence detected - skipped")
 		fmt.Println()
 		// Reset processor to discard any accumulated audio from this session
@@ -234,7 +219,6 @@ func (d *Daemon) OnRelease() {
 
 	// Also check traditional silence detection for very quiet recordings
 	if !hadProlongedSilence && maxRMS < 150.0 {
-		log.Printf("[SESSION] Low audio level detected (RMS %.2f < 150.0), skipping transcription", maxRMS)
 		fmt.Println("🔇 No speech detected - skipped")
 		fmt.Println()
 		// Reset processor to discard any accumulated audio from this session
@@ -242,59 +226,36 @@ func (d *Daemon) OnRelease() {
 		return
 	}
 
-	log.Printf("[SESSION] Audio detected, using real-time streaming approach")
-
 	// Immediate termination for true streaming - send termination right away
-	log.Printf("[SESSION] Sending immediate termination signal at %s", time.Now().Format("15:04:05.000"))
 	d.transcriptClient.Terminate()
-
-	// Fixed timeout for reliability + UX balance
-	log.Printf("[SESSION] Using 1s termination timeout (balanced for reliability + UX)")
-
-	// Wait for AssemblyAI termination confirmation (protocol-based approach)
-	log.Printf("[SESSION] Waiting for AssemblyAI termination confirmation...")
-	waitStartTime := time.Now()
 
 	terminationTimeout := 1 * time.Second // Balanced timeout for reliability + UX
 	select {
 	case <-d.processor.WaitForTermination():
-		log.Printf("[SESSION] Termination confirmed after %v", time.Since(waitStartTime))
 	case <-time.After(terminationTimeout):
-		log.Printf("[SESSION] Termination timeout after %.1fs, proceeding anyway", terminationTimeout.Seconds())
 	}
 
 	// Get the final transcript or fallback to best partial
-	log.Printf("[SESSION] Retrieving transcript...")
-	text, isFinal := d.processor.ConsumeTranscriptWithFallback()
+	text, _ := d.processor.ConsumeTranscriptWithFallback()
 
 	// Guarantee clean state for next session (prevents cross-session contamination)
-	log.Printf("[SESSION] Ensuring clean processor state for next session")
 	d.processor.Reset()
 
 	if text != "" {
-		transcriptType := "final"
-		if !isFinal {
-			transcriptType = "partial fallback"
-		}
-		log.Printf("[SESSION] SUCCESS: %s transcript length: %d chars", transcriptType, len(text))
 		if err := clipboard.PasteTextSafely(text); err != nil {
-			log.Printf("[SESSION] ERROR: Paste failed: %v", err)
 			fmt.Printf("❌ Paste failed: %v\n", err)
 		} else {
-			log.Printf("[SESSION] Text pasted successfully")
 			// Record metrics and display enhanced output
 			d.displaySessionMetrics(text)
 			// Report successful session to improve connection health
 			d.transcriptClient.ReportSessionSuccess()
 		}
 	} else {
-		log.Printf("[SESSION] ERROR: No transcription received")
 		fmt.Println("❌ No transcription received")
 		// Report failed session to degrade connection health
 		d.transcriptClient.ReportSessionFailure()
 	}
 	fmt.Println()
-	log.Printf("[SESSION] ===== SESSION COMPLETE =====")
 }
 
 // handleTranscript handles incoming transcripts from the transcription client

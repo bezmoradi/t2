@@ -153,15 +153,9 @@ func NewStatsFormatter() *StatsFormatter {
 }
 
 func (sf *StatsFormatter) FormatSessionSummary(session *SessionMetrics, todayMetrics *DailyMetrics) string {
-	timeSavedStr := sf.timeFormatter.FormatDurationShort(session.TimeSaved)
-
 	summary := fmt.Sprintf("✅ Pasted %d words (%s recording)\n",
 		session.WordCount,
 		sf.timeFormatter.FormatDurationShort(session.RecordingTime))
-
-	if session.TimeSaved > 0 {
-		summary += fmt.Sprintf("💡 Saved %s vs typing\n", timeSavedStr)
-	}
 
 	if session.SpeakingRate > 0 {
 		summary += fmt.Sprintf("📊 Session: %d WPM speaking rate\n", session.SpeakingRate)
@@ -176,16 +170,10 @@ func (sf *StatsFormatter) FormatSessionSummary(session *SessionMetrics, todayMet
 }
 
 func (sf *StatsFormatter) FormatSessionSummaryLines(session *SessionMetrics, todayMetrics *DailyMetrics) []string {
-	timeSavedStr := sf.timeFormatter.FormatDurationShort(session.TimeSaved)
-
 	lines := []string{
 		fmt.Sprintf("✅ Pasted %d words (%s recording)",
 			session.WordCount,
 			sf.timeFormatter.FormatDurationShort(session.RecordingTime)),
-	}
-
-	if session.TimeSaved > 0 {
-		lines = append(lines, fmt.Sprintf("💡 Saved %s vs typing", timeSavedStr))
 	}
 
 	if session.SpeakingRate > 0 {

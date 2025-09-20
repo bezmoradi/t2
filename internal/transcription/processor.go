@@ -35,9 +35,7 @@ func (p *Processor) ProcessTranscript(transcript string, turnOrder int, isComple
 	// where each partial transcript contains the complete accumulated text
 	if isComplete {
 		// Add final transcripts to our collection to handle multiple sessions
-		// Append space to ensure proper spacing between sentences
-		transcriptWithSpace := transcript + " "
-		p.finalTranscripts = append(p.finalTranscripts, transcriptWithSpace)
+		p.finalTranscripts = append(p.finalTranscripts, transcript)
 
 
 		// Build complete transcript from all final transcripts
@@ -156,8 +154,8 @@ func (p *Processor) ConsumeTranscriptWithFallback() (string, bool) {
 	isFinal := len(p.finalTranscripts) > 0
 
 	if isFinal {
-		// Use final transcript
-		text = p.currentTranscript
+		// Use final transcript and add trailing space
+		text = p.currentTranscript + " "
 	} else if len(p.bestPartialTranscript) > 0 {
 		// Use best partial as fallback
 		text = p.bestPartialTranscript + " " // Add space for consistency

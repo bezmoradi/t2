@@ -96,8 +96,8 @@ func (c *Control) UpdateInPlace(lines []string, isFirstUpdate bool) {
 	}
 
 	if !isFirstUpdate {
-		// Move cursor up to overwrite previous output
-		c.MoveCursorUp(len(lines))
+		// Move cursor up to overwrite previous output (including final newline)
+		c.MoveCursorUp(len(lines) + 1)
 	}
 
 	// Print each line, clearing it first if not the first update
@@ -113,10 +113,8 @@ func (c *Control) UpdateInPlace(lines []string, isFirstUpdate bool) {
 		}
 	}
 
-	// Ensure we end with a newline for proper positioning
-	if isFirstUpdate {
-		fmt.Println()
-	}
+	// Always ensure we end with a newline for consistent cursor positioning
+	fmt.Println()
 }
 
 // HideCursor hides the terminal cursor

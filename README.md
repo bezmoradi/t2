@@ -55,7 +55,7 @@ That will tell you whether you’re in `zsh`, `bash`, or another shell. Update t
 To install the tool, run the following command inside terminal:
 
 ```sh
-$ go install github.com/bezmoradi/t2/cmd/t2@main
+$ go install github.com/bezmoradi/t2/cmd/t2@latest
 ```
 
 To make sure it's installed correctly in your `$GOPATH`, run the following command:

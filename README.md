@@ -101,15 +101,6 @@ AssemblyAI API key not found.
 
 # Reset API key (removes saved config)
 ./t2 --reset-key
-
-# Show usage statistics and productivity metrics
-./t2 --stats
-
-# Clear all usage statistics
-./t2 --reset-stats
-
-# Set your typing speed for accurate time savings calculation
-./t2 --set-typing-speed=65
 ```
 
 ## Building from Source

@@ -1,28 +1,25 @@
 package audio
 
-import (
-	"os/exec"
+import "os/exec"
 
-	"github.com/gen2brain/beeep"
-)
-
-// PlayBeep plays system beep sound for audio feedback
+// PlayBeep plays a short feedback sound. It does not block.
+//
+// This used to call beeep.Beep, which on macOS ignores its frequency and
+// duration arguments entirely and shells out to `osascript -e beep`
+// synchronously: ~100ms of dead time on the press and release paths, twice per
+// recording, for two identical sounds where the code claimed to play different
+// tones for start and stop.
 func PlayBeep(beepType string) {
-	// Play system beep sound for audio feedback
-	switch beepType {
-	case "start":
-		// System beep or notification sound
-		err := beeep.Beep(beeep.DefaultFreq, beeep.DefaultDuration/2)
-		if err != nil {
-			// Fallback to system beep command
-			exec.Command("osascript", "-e", "beep 1").Run()
-		}
-	case "stop":
-		// Different tone for stop
-		err := beeep.Beep(beeep.DefaultFreq*2, beeep.DefaultDuration/3)
-		if err != nil {
-			// Fallback to system beep command
-			exec.Command("osascript", "-e", "beep 2").Run()
-		}
+	sound := "/System/Library/Sounds/Tink.aiff"
+	if beepType == "stop" {
+		sound = "/System/Library/Sounds/Pop.aiff"
 	}
+
+	cmd := exec.Command("afplay", sound)
+	if err := cmd.Start(); err != nil {
+		return
+	}
+
+	// Reap the child without waiting on it here.
+	go cmd.Wait()
 }

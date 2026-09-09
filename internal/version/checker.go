@@ -4,12 +4,19 @@ import (
 	"io"
 	"net/http"
 	"regexp"
+	"time"
+
+	"golang.org/x/mod/semver"
 )
 
 const VERSION_URL = "https://raw.githubusercontent.com/bezmoradi/t2/main/internal/version/version.go"
 
+// The version check gates startup, so it must never be able to hang the app on
+// a slow or wedged network.
+var httpClient = &http.Client{Timeout: 5 * time.Second}
+
 func CheckVersion() (bool, string) {
-	res, err := http.Get(VERSION_URL)
+	res, err := httpClient.Get(VERSION_URL)
 	if err != nil {
 		return true, ""
 	}
@@ -23,7 +30,21 @@ func CheckVersion() (bool, string) {
 	}
 
 	newVersion := extractVersion(string(bytes))
-	if VERSION != newVersion {
+
+	// An unparseable body means we could not determine the remote version - a
+	// renamed file, a 404 page served as 200, or a reformatted declaration.
+	// Treat that as "no answer" and let the app run. Comparing against the
+	// empty string here would report every install as out of date and refuse
+	// to start, with a message naming no version at all.
+	if newVersion == "" {
+		return true, ""
+	}
+
+	// Only a strictly newer remote version is worth reporting. Comparing with
+	// != also fired when the local build was *ahead* of main, which is exactly
+	// what happens while bumping the version before pushing, and refused to
+	// start.
+	if semver.Compare(newVersion, VERSION) > 0 {
 		return false, newVersion
 	}
 

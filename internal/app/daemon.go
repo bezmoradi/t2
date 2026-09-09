@@ -2,9 +2,9 @@ package app
 
 import (
 	"fmt"
-	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -12,89 +12,68 @@ import (
 	"github.com/bezmoradi/t2/internal/clipboard"
 	"github.com/bezmoradi/t2/internal/config"
 	"github.com/bezmoradi/t2/internal/hotkeys"
-	"github.com/bezmoradi/t2/internal/metrics"
-	"github.com/bezmoradi/t2/internal/terminal"
 	"github.com/bezmoradi/t2/internal/transcription"
 )
 
-type Daemon struct {
-	config             *config.Config
-	recorder           *audio.Recorder
-	transcriptClient   *transcription.Client
-	processor          *transcription.Processor
-	hotkeyManager      *hotkeys.Manager
-	metricsManager     *metrics.MetricsManager
-	terminalControl    *terminal.Control
-	apiKey             string
-	currentTurnOrder   int
-	sessionStartTime   time.Time
-	isFirstSession     bool
-	pressTime          time.Time
-	quickPressThreshold time.Duration
+const (
+	// quickPressThreshold discards taps too short to be dictation. It is
+	// measured from the poller's edge timestamps, so it reflects the real hold
+	// rather than whatever time was left after dialling and beeping. It can be
+	// this short because shortcuts like Ctrl+Shift+T are now rejected outright
+	// by the hotkey layer instead of being absorbed here.
+	quickPressThreshold = 400 * time.Millisecond
+
+	// terminationTimeout is a safety net for an unresponsive server, not a
+	// latency knob. The server finalises the open turn when it receives
+	// Terminate, so cutting this short costs punctuation on the last turn.
+	terminationTimeout = 4 * time.Second
+
+	// beginTimeout bounds the wait for the server to confirm the session
+	// before streaming buffered audio at it.
+	beginTimeout = 5 * time.Second
+)
+
+type dialResult struct {
+	session *transcription.Session
+	err     error
 }
 
-func NewDaemon() *Daemon {
+type Daemon struct {
+	recorder      *audio.Recorder
+	hotkeyManager *hotkeys.Manager
+	sink          *audioSink
+	apiKey        string
+	verbose       bool
+
+	dialDone  chan dialResult
+	listenEnd chan struct{}
+}
+
+func NewDaemon(verbose bool) *Daemon {
 	return &Daemon{
-		isFirstSession:      true,
-		quickPressThreshold: 800 * time.Millisecond,
+		sink:      newAudioSink(),
+		verbose:   verbose,
+		listenEnd: make(chan struct{}),
 	}
 }
 
 func (d *Daemon) Initialize() error {
-	// Get API key using fallback priority system
 	var err error
 	d.apiKey, err = config.GetAPIKey()
 	if err != nil {
 		return fmt.Errorf("failed to get AssemblyAI API key: %v", err)
 	}
 
-	// Load configuration
-	d.config, err = config.LoadConfig()
-	if err != nil {
-		d.config = &config.Config{}
-	}
-
-	// Initialize processor
-	d.processor = transcription.NewProcessor()
-
-	// Initialize transcription client
-	d.transcriptClient = transcription.NewClient(
-		d.handleTranscript,
-		d.handleConnection,
-	)
-	d.transcriptClient.SetTerminationCallback(d.handleTermination)
-
-	// Initialize recorder with audio callback
-	d.recorder = audio.NewRecorder(d.transcriptClient.SendAudio)
-
-	// Silence detection is now handled on key release instead of real-time callback
-	// d.recorder.SetSilenceCallback(d.handleSilenceDetected)
-
-	// Initialize hotkey manager
+	d.recorder = audio.NewRecorder(d.sink.write)
 	d.hotkeyManager = hotkeys.NewManager(d)
 
-	// Initialize metrics manager
-	metricsDir, err := config.GetMetricsDir()
-	if err != nil {
-		return fmt.Errorf("failed to get metrics directory: %v", err)
-	}
-	d.metricsManager, err = metrics.NewMetricsManager(metricsDir)
-	if err != nil {
-		return fmt.Errorf("failed to initialize metrics manager: %v", err)
-	}
-
-	// Initialize terminal control
-	d.terminalControl = terminal.NewControl()
-
-	// Initialize PortAudio
 	if err := audio.Initialize(); err != nil {
 		return fmt.Errorf("failed to initialize PortAudio: %v", err)
 	}
 
-	// Connect to AssemblyAI
-	if err := d.transcriptClient.Connect(d.apiKey); err != nil {
-		return fmt.Errorf("failed to connect to AssemblyAI streaming API: %v", err)
-	}
+	// No session is opened here. AssemblyAI bills the wall-clock time a
+	// connection stays open, so a session dialled at startup and left idle
+	// until the first recording is billed for the entire wait.
 
 	return nil
 }
@@ -104,7 +83,6 @@ func (d *Daemon) Run() error {
 		return fmt.Errorf("failed to start hotkey: %v", err)
 	}
 
-	// Setup graceful shutdown
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 
@@ -113,220 +91,217 @@ func (d *Daemon) Run() error {
 	fmt.Println("🛑 Press Ctrl+C to exit")
 	fmt.Println()
 
-	// Start hotkey listening in a goroutine
-	go d.hotkeyManager.Listen()
+	go func() {
+		defer close(d.listenEnd)
+		d.hotkeyManager.Listen()
+	}()
 
-	// Wait for shutdown signal
 	<-c
 	fmt.Println("\n🛑 Shutting down...")
 	d.Cleanup()
+
 	return nil
 }
 
 func (d *Daemon) Cleanup() {
-	// Stop hotkey manager
+	// Stop feeding the handler, then let any in-flight recording finish, so we
+	// do not tear PortAudio down underneath a running capture or abandon a
+	// session that is still being billed.
 	if d.hotkeyManager != nil {
 		d.hotkeyManager.Stop()
+		select {
+		case <-d.listenEnd:
+		case <-time.After(terminationTimeout + 2*time.Second):
+		}
 	}
 
-	// Stop recording if still running
 	if d.recorder != nil {
 		d.recorder.Stop()
 	}
 
-	// Close transcription client
-	if d.transcriptClient != nil {
-		d.transcriptClient.Close()
-	}
-
-	// Terminate PortAudio
 	audio.Terminate()
 }
 
 // OnPress implements hotkeys.EventHandler
 func (d *Daemon) OnPress() {
-
-	// Check if already recording to prevent overlapping sessions
 	if d.recorder.IsRecording() {
 		return
 	}
 
-	// Check if connection needs refresh due to degradation
-	if d.transcriptClient.ConnectionNeedsRefresh() {
-		d.transcriptClient.Close()
-		time.Sleep(100 * time.Millisecond)
-	}
-
-	// Silently reconnect if needed (happens after Terminate closes the connection)
-	if !d.transcriptClient.IsConnected() {
-		if err := d.transcriptClient.Connect(d.apiKey); err != nil {
-			fmt.Printf("❌ Connection failed: %v\n", err)
-			d.transcriptClient.ReportSessionFailure()
-			return
-		}
-		// Brief pause to let connection establish
-		time.Sleep(150 * time.Millisecond)
-	}
-
 	audio.PlayBeep("start")
 
-	// Reset processor for new recording
-	d.processor.Reset()
-	d.currentTurnOrder = 0
+	// Capture first, dial second. The handshake costs 60-140ms of TLS plus an
+	// HTTP upgrade; if capture waited for it, every recording would lose its
+	// opening syllable. Audio buffers in the sink until the session is ready.
+	d.sink.reset()
+	if err := d.recorder.Start(); err != nil {
+		fmt.Printf("❌ Could not start recording: %v\n", err)
+		fmt.Println("   Check that this terminal has Microphone permission.")
+		fmt.Println()
+		return
+	}
 
-	// Record press time for quick-press detection (just before starting recording)
-	d.pressTime = time.Now()
+	d.dialDone = make(chan dialResult, 1)
+	go func(done chan dialResult) {
+		started := time.Now()
 
-	// Record session start time for metrics
-	d.sessionStartTime = time.Now()
+		session, err := transcription.Dial(d.apiKey, audio.SampleRate)
+		if err != nil {
+			done <- dialResult{err: err}
+			return
+		}
 
-	d.recorder.Start()
+		// Wait for Begin rather than sleeping a fixed 150ms: it is the actual
+		// signal that the session exists and can accept audio.
+		select {
+		case <-session.Begun():
+		case <-time.After(beginTimeout):
+		}
+
+		d.sink.attach(session)
+		d.logf("dial+begin took %v", time.Since(started).Round(time.Millisecond))
+
+		done <- dialResult{session: session}
+	}(d.dialDone)
 }
 
 // OnRelease implements hotkeys.EventHandler
-func (d *Daemon) OnRelease() {
-
-	// Check if we're actually recording
+func (d *Daemon) OnRelease(held time.Duration, cancelled bool) {
 	if !d.recorder.IsRecording() {
 		return
 	}
 
-	// Calculate recording duration for quick-press detection
-	recordingDuration := time.Since(d.pressTime)
-
-	d.recorder.Stop()
+	outcome := d.recorder.Stop()
 	audio.PlayBeep("stop")
 
-	// Layer 1: Check for quick press - skip transcription if too short
-	if recordingDuration < d.quickPressThreshold {
-		fmt.Println("⚡ Quick press detected - skipped")
+	// The dial may still be in flight; it owns the session either way.
+	result := <-d.dialDone
+	d.dialDone = nil
+
+	if result.err != nil {
+		fmt.Printf("❌ Could not reach AssemblyAI: %v\n", result.err)
+		d.saveAudio()
 		fmt.Println()
 		return
 	}
 
-	// Layer 2: Check for prolonged silence or low audio levels
-	maxRMS := d.recorder.GetMaxRMS()
-	hadProlongedSilence := d.recorder.HasProlongedSilence()
+	session := result.session
 
-	// Skip if we had prolonged silence without any significant speech
-	if hadProlongedSilence && maxRMS < 150.0 {
-		fmt.Println("🔇 Real-time silence detected - skipped")
+	// Every path from here closes the session. One left open stays billed
+	// until the server's 3-hour cap.
+
+	if cancelled {
+		session.Discard()
+		fmt.Println("⌨️  Shortcut detected - skipped")
 		fmt.Println()
-		// Reset processor to discard any accumulated audio from this session
-		d.processor.Reset()
 		return
 	}
 
-	// Also check traditional silence detection for very quiet recordings
-	if !hadProlongedSilence && maxRMS < 150.0 {
-		fmt.Println("🔇 No speech detected - skipped")
+	if held < quickPressThreshold {
+		session.Discard()
+		fmt.Printf("⚡ Quick press (%v) - skipped\n", held.Round(time.Millisecond))
 		fmt.Println()
-		// Reset processor to discard any accumulated audio from this session
-		d.processor.Reset()
 		return
 	}
 
-	// Immediate termination for true streaming - send termination right away
-	d.transcriptClient.Terminate()
-
-	terminationTimeout := 1 * time.Second // Balanced timeout for reliability + UX
-	select {
-	case <-d.processor.WaitForTermination():
-	case <-time.After(terminationTimeout):
+	if maxRMS := d.recorder.GetMaxRMS(); maxRMS < audio.SilenceThreshold {
+		session.Discard()
+		fmt.Printf("🔇 No speech detected - skipped (level %.0f, threshold %.0f)\n",
+			maxRMS, audio.SilenceThreshold)
+		fmt.Println()
+		return
 	}
 
-	// Get the final transcript or fallback to best partial
-	text, _ := d.processor.ConsumeTranscriptWithFallback()
+	transcript := session.Finish(terminationTimeout)
 
-	// Guarantee clean state for next session (prevents cross-session contamination)
-	d.processor.Reset()
+	d.logf("held %v, %d chunks, %d overflow(s), model %q, audio %.1fs, billed %.1fs",
+		held.Round(time.Millisecond), outcome.Chunks, outcome.Overflows,
+		transcript.Model, transcript.AudioSeconds, transcript.SessionSeconds)
 
-	if text != "" {
-		if err := clipboard.PasteTextSafely(text); err != nil {
-			fmt.Printf("❌ Paste failed: %v\n", err)
-		} else {
-			// Record metrics and display enhanced output
-			d.displaySessionMetrics(text)
-			// Report successful session to improve connection health
-			d.transcriptClient.ReportSessionSuccess()
-		}
-	} else {
+	d.report(transcript, outcome)
+}
+
+// report pastes the transcript and says plainly what was produced.
+//
+// The old code printed a green check for any non-empty text, so a truncated
+// capture, a dropped connection and an unformatted partial all looked like
+// success. Anything short of a clean formatted result now says so.
+func (d *Daemon) report(t transcription.Result, outcome audio.Outcome) {
+	defer fmt.Println()
+
+	sendErr := d.sink.err()
+
+	if t.Text == "" {
 		fmt.Println("❌ No transcription received")
-		// Report failed session to degrade connection health
-		d.transcriptClient.ReportSessionFailure()
-	}
-	fmt.Println()
-}
-
-// handleTranscript handles incoming transcripts from the transcription client
-func (d *Daemon) handleTranscript(transcript string, isComplete bool, endOfTurn bool, confidence float64) {
-	// AssemblyAI sends progressive partial transcripts that already contain
-	// the accumulated text, so we use the same turn order (0) for all partials
-	// and only mark completion when we get the final formatted transcript
-
-	turnOrder := 0
-	d.processor.ProcessTranscript(transcript, turnOrder, isComplete, endOfTurn, confidence)
-}
-
-// handleConnection handles connection status changes
-func (d *Daemon) handleConnection(connected bool) {
-	// Connection status changes are handled silently
-	// Audio beeps provide user feedback instead
-}
-
-// handleTermination handles session termination from AssemblyAI
-func (d *Daemon) handleTermination() {
-	d.processor.SignalTermination()
-}
-
-// handleSilenceDetected handles real-time silence detection from audio recorder
-func (d *Daemon) handleSilenceDetected() {
-	log.Printf("[SESSION] Real-time silence detected by audio recorder")
-
-	// Check if we're actually recording to prevent race conditions
-	if !d.recorder.IsRecording() {
-		log.Printf("[SESSION] Silence detected but not recording, ignoring")
+		if t.Err != nil {
+			fmt.Printf("   %v\n", t.Err)
+		}
+		if sendErr != nil {
+			fmt.Printf("   audio streaming stopped: %v\n", sendErr)
+		}
+		d.saveAudio()
 		return
 	}
 
-	// Stop recording immediately
-	log.Printf("[SESSION] Stopping recording due to real-time silence detection")
-	d.recorder.Stop()
-	audio.PlayBeep("stop")
+	if err := clipboard.PasteTextSafely(t.Text); err != nil {
+		fmt.Printf("❌ Paste failed: %v\n", err)
+		fmt.Printf("   Transcript: %s\n", t.Text)
+		return
+	}
 
-	// Log the session as skipped due to silence
-	log.Printf("[SESSION] Real-time silence skipped")
-	fmt.Println("🔇 Real-time silence detected - skipped")
-	fmt.Println()
-	log.Printf("[SESSION] ===== SESSION COMPLETE =====")
-}
-
-func (d *Daemon) displaySessionMetrics(text string) {
-	// Calculate recording duration
-	recordingDuration := time.Since(d.sessionStartTime)
-
-	// Record session metrics
-	sessionMetrics, err := d.metricsManager.RecordSession(text, recordingDuration)
-	if err != nil {
-		fmt.Printf("⚠️  Warning: Failed to record session metrics: %v\n", err)
+	switch {
+	case sendErr != nil:
+		fmt.Println("⚠️  Pasted, but the connection dropped mid-recording - text may be incomplete")
+		fmt.Printf("   %v\n", sendErr)
+		d.saveAudio()
+	case outcome.Err != nil:
+		fmt.Println("⚠️  Pasted, but recording stopped early - text may be incomplete")
+		fmt.Printf("   %v\n", outcome.Err)
+		d.saveAudio()
+	case !t.Complete:
+		// Carries the server's close code and reason, which used to disappear
+		// into a bare "No transcription received".
+		fmt.Println("⚠️  Pasted, but the session ended abnormally - text may be incomplete")
+		fmt.Printf("   %v\n", t.Err)
+		d.saveAudio()
+	case outcome.Overflows > 0:
+		fmt.Printf("⚠️  Pasted, but %d audio chunk(s) were dropped - text may have gaps\n", outcome.Overflows)
+	case !t.FromFinal:
+		fmt.Println("⚠️  Pasted an unformatted draft - the server did not finish in time")
+	default:
 		fmt.Println("✅ Pasted to active application")
+	}
+
+	// Print the text too, so it survives a clipboard that gets overwritten
+	// before the user notices the paste landed somewhere unexpected.
+	fmt.Printf("   %s\n", t.Text)
+}
+
+// saveAudio writes the captured recording to disk, so a failure anywhere
+// downstream never costs the user what they already said.
+func (d *Daemon) saveAudio() {
+	pcm := d.sink.audio()
+	if len(pcm) == 0 {
 		return
 	}
 
-	// Get today's metrics for cumulative display
-	todayMetrics, err := d.metricsManager.GetTodayMetrics()
+	dir, err := config.GetConfigDir()
 	if err != nil {
-		fmt.Printf("⚠️  Warning: Failed to get today's metrics: %v\n", err)
-		todayMetrics = nil
+		return
 	}
 
-	// Format and display the enhanced output with dynamic updates
-	formatter := metrics.NewStatsFormatter()
-	lines := formatter.FormatSessionSummaryLines(sessionMetrics, todayMetrics)
+	path := filepath.Join(dir, "last-recording.wav")
+	if err := audio.WriteWAV(path, pcm); err != nil {
+		fmt.Printf("   (could not save audio: %v)\n", err)
+		return
+	}
 
-	// Use terminal control for dynamic updates
-	d.terminalControl.UpdateInPlace(lines, d.isFirstSession)
+	fmt.Printf("   Audio saved to %s\n", path)
+}
 
-	// Mark that we've had our first session
-	d.isFirstSession = false
+func (d *Daemon) logf(format string, args ...any) {
+	if !d.verbose {
+		return
+	}
+	fmt.Printf("   [v] "+format+"\n", args...)
 }

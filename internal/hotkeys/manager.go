@@ -1,8 +1,13 @@
 package hotkeys
 
+import "time"
+
 type EventHandler interface {
 	OnPress()
-	OnRelease()
+	// OnRelease reports how long the key was actually held, measured from the
+	// poller's own edge timestamps rather than from wall-clock time inside the
+	// handler, and whether the hold was cancelled by another key going down.
+	OnRelease(held time.Duration, cancelled bool)
 }
 
 type Manager struct {
@@ -27,19 +32,6 @@ func (m *Manager) Listen() {
 	m.simple.Listen()
 }
 
-func (m *Manager) UpdateConfig() error {
-	// No config needed - hotkey is hardcoded
-	return nil
-}
-
 func (m *Manager) GetHotkeyDisplay() string {
 	return "Ctrl+Shift"
-}
-
-func (m *Manager) GetEngineType() string {
-	return "simple"
-}
-
-func (m *Manager) IsUsingPrimaryEngine() bool {
-	return true
 }

@@ -1,11 +1,10 @@
 package audio
 
 import (
-	"log"
+	"errors"
+	"fmt"
 	"math"
-	"strings"
 	"sync"
-	"time"
 
 	"github.com/gordonklaus/portaudio"
 )
@@ -13,46 +12,55 @@ import (
 const (
 	SampleRate = 16000
 	Frames     = 1024
+
+	// SilenceThreshold is the RMS below which a recording counts as silence.
+	// Samples are int16, so full scale is 32767 and this is about -47 dBFS.
+	// Shared with the daemon, which applies it to the whole recording.
+	SilenceThreshold = 150.0
+
+	// ignoreLeadingChunks excludes the start of a recording from the level
+	// measurement. The start beep is played through the speakers immediately
+	// before capture opens, and if the microphone hears its tail it would set
+	// the peak level on its own and defeat the silence gate entirely.
+	ignoreLeadingChunks = 3
 )
 
-// SpeechState represents the current state of speech detection
-type SpeechState int
+// Outcome describes how a recording ended. Anything other than a clean stop
+// means the audio is incomplete, and the caller must not report success.
+type Outcome struct {
+	// Err is set when capture stopped on its own before Stop was called.
+	Err error
 
-const (
-	WaitingForSpeech SpeechState = iota // Waiting for initial speech - aggressive silence detection
-	SpeechDetected                      // Speech has been detected - disable silence cutoff
-)
+	// Overflows counts chunks where PortAudio discarded input before we read
+	// it. The data in those chunks is still valid; the audio has a gap.
+	Overflows int
+
+	// Chunks is how many audio chunks were captured.
+	Chunks int
+}
+
+// Incomplete reports whether the recording ended early or lost audio.
+func (o Outcome) Incomplete() bool { return o.Err != nil || o.Overflows > 0 }
 
 type Recorder struct {
-	recording        bool
-	stream           *portaudio.Stream
-	recordingMutex   sync.Mutex
-	audioCallback    func([]byte) error
-	silenceCallback  func()              // Called when silence is detected
-	stopChan         chan struct{}
-	streamWg         sync.WaitGroup
-	maxRMS           float64
-	silenceThreshold float64
-	silenceChunks    int                 // Count of consecutive silent chunks
-	maxSilenceChunks int                 // Max silent chunks before triggering callback
-	speechState      SpeechState         // Track current speech detection state
-	prolongedSilence bool                // Flag to track if we've had prolonged silence without speech
+	recording      bool
+	stream         *portaudio.Stream
+	recordingMutex sync.Mutex
+	audioCallback  func([]byte) error
+	stopChan       chan struct{}
+	streamWg       sync.WaitGroup
+
+	maxRMS    float64
+	chunks    int
+	overflows int
+	exitErr   error
 }
 
 func NewRecorder(audioCallback func([]byte) error) *Recorder {
 	return &Recorder{
-		audioCallback:    audioCallback,
-		stopChan:         make(chan struct{}),
-		silenceThreshold: 150.0, // Threshold for silence detection (lowered to match daemon)
-		maxSilenceChunks: 20,     // ~500ms of silence at 40ms chunks (20*25ms per chunk)
+		audioCallback: audioCallback,
+		stopChan:      make(chan struct{}),
 	}
-}
-
-// SetSilenceCallback sets the callback function for silence detection
-func (r *Recorder) SetSilenceCallback(callback func()) {
-	r.recordingMutex.Lock()
-	defer r.recordingMutex.Unlock()
-	r.silenceCallback = callback
 }
 
 func (r *Recorder) IsRecording() bool {
@@ -65,12 +73,6 @@ func (r *Recorder) GetMaxRMS() float64 {
 	r.recordingMutex.Lock()
 	defer r.recordingMutex.Unlock()
 	return r.maxRMS
-}
-
-func (r *Recorder) HasProlongedSilence() bool {
-	r.recordingMutex.Lock()
-	defer r.recordingMutex.Unlock()
-	return r.prolongedSilence
 }
 
 // calculateRMS computes the Root Mean Square of int16 audio samples
@@ -94,66 +96,52 @@ func (r *Recorder) Start() error {
 		return nil
 	}
 
-	r.recording = true
-
-	// Reset audio level tracking for new session
+	// Reset per-recording state.
 	r.maxRMS = 0.0
-
-	// Reset silence detection for new session
-	r.silenceChunks = 0
-	r.speechState = WaitingForSpeech
-	r.prolongedSilence = false
-
-	// Create new stop channel for this session
+	r.chunks = 0
+	r.overflows = 0
+	r.exitErr = nil
 	r.stopChan = make(chan struct{})
 
-	// Setup audio buffer for streaming (PCM16 format for AssemblyAI)
-	in := make([]int32, Frames)
+	// Capture straight into int16: it is what AssemblyAI wants on the wire and
+	// what the RMS maths needs, so nothing has to be converted per chunk.
+	in := make([]int16, Frames)
 
-	// Open PortAudio stream
-	var err error
-	r.stream, err = portaudio.OpenDefaultStream(1, 0, SampleRate, len(in), in)
+	stream, err := portaudio.OpenDefaultStream(1, 0, SampleRate, len(in), in)
 	if err != nil {
-		log.Printf("Error opening PortAudio stream: %v", err)
-		r.recording = false
-		return err
+		return fmt.Errorf("opening microphone: %w", err)
 	}
 
-	// Start the stream
-	if err := r.stream.Start(); err != nil {
-		log.Printf("Error starting PortAudio stream: %v", err)
-		r.recording = false
-		r.stream.Close()
-		r.stream = nil
-		return err
+	if err := stream.Start(); err != nil {
+		stream.Close()
+		return fmt.Errorf("starting microphone: %w", err)
 	}
 
-	// Start streaming audio in a goroutine with proper synchronization
+	r.stream = stream
+	r.recording = true
+
 	r.streamWg.Add(1)
 	go r.audioStreamLoop(in)
 
 	return nil
 }
 
-func (r *Recorder) Stop() {
+// Stop ends capture and reports how the recording actually went.
+func (r *Recorder) Stop() Outcome {
 	r.recordingMutex.Lock()
 
 	if !r.recording {
 		r.recordingMutex.Unlock()
-		return
+		return Outcome{}
 	}
 
 	r.recording = false
-
-	// Signal the audio goroutine to stop
 	close(r.stopChan)
-
 	r.recordingMutex.Unlock()
 
-	// Wait for the audio goroutine to finish properly
+	// Wait for the audio goroutine before touching the stream.
 	r.streamWg.Wait()
 
-	// Now safely clean up the stream
 	r.recordingMutex.Lock()
 	defer r.recordingMutex.Unlock()
 
@@ -162,139 +150,88 @@ func (r *Recorder) Stop() {
 		r.stream.Close()
 		r.stream = nil
 	}
+
+	return Outcome{Err: r.exitErr, Overflows: r.overflows, Chunks: r.chunks}
 }
 
-func (r *Recorder) audioStreamLoop(in []int32) {
+func (r *Recorder) audioStreamLoop(in []int16) {
 	defer func() {
-		if r := recover(); r != nil {
-			log.Printf("Audio streaming goroutine recovered from panic: %v", r)
+		// A panic here used to be swallowed while leaving the recorder marked as
+		// recording, so the failure surfaced as a silently truncated transcript.
+		if p := recover(); p != nil {
+			r.recordingMutex.Lock()
+			r.exitErr = fmt.Errorf("capture panicked: %v", p)
+			r.recordingMutex.Unlock()
 		}
-		r.streamWg.Done() // Signal that the goroutine has finished
+		r.streamWg.Done()
 	}()
 
+	pcm := make([]byte, len(in)*2)
+
 	for {
-		// Check if we should stop using the stop channel
 		select {
 		case <-r.stopChan:
 			return
 		default:
 		}
 
-		// Get current stream state safely
-		r.recordingMutex.Lock()
-		isRecording := r.recording
-		currentStream := r.stream
-		r.recordingMutex.Unlock()
-
-		// Exit if not recording or stream is nil
-		if !isRecording || currentStream == nil {
-			return
-		}
-
-		// Perform the stream read with proper error handling
-		if err := currentStream.Read(); err != nil {
-			// Check if we're still supposed to be recording before logging
-			select {
-			case <-r.stopChan:
-				// Stop was called, this error is expected
-				return
-			default:
+		// Read blocks until a full buffer is available, which is the loop's
+		// pacing. There is no sleep here on purpose: sleeping only eats the
+		// headroom in PortAudio's ring buffer and causes the overflows below.
+		if err := r.stream.Read(); err != nil {
+			// paInputOverflowed is reported alongside a full, valid buffer: it
+			// means input was discarded before this call, not that the read
+			// failed. Treating it as fatal killed capture mid-sentence and the
+			// tool still reported success.
+			if errors.Is(err, portaudio.InputOverflowed) {
 				r.recordingMutex.Lock()
-				stillRecording := r.recording
+				r.overflows++
 				r.recordingMutex.Unlock()
-
-				if stillRecording {
-					log.Printf("Error reading from stream: %v", err)
-				}
-				return
-			}
-		}
-
-		// Convert int32 to PCM16 bytes for AssemblyAI (little-endian)
-		pcmBytes := make([]byte, len(in)*2) // 2 bytes per int16
-		samples16 := make([]int16, len(in))  // For RMS calculation
-
-		for i, sample := range in {
-			// Convert int32 to int16 (PCM16)
-			sample16 := int16(sample >> 16)
-			samples16[i] = sample16
-			pcmBytes[i*2] = byte(sample16)        // Low byte
-			pcmBytes[i*2+1] = byte(sample16 >> 8) // High byte
-		}
-
-		// Calculate RMS for this chunk and update maximum
-		chunkRMS := calculateRMS(samples16)
-		r.recordingMutex.Lock()
-		if chunkRMS > r.maxRMS {
-			r.maxRMS = chunkRMS
-		}
-
-		// Real-time silence detection
-		isSilent := chunkRMS < r.silenceThreshold
-		if isSilent {
-			r.silenceChunks++
-		} else {
-			// Speech detected - reset silence counter and update state
-			r.silenceChunks = 0
-
-			// Transition from WaitingForSpeech to SpeechDetected
-			if r.speechState == WaitingForSpeech {
-				r.speechState = SpeechDetected
-			}
-		}
-
-		// Mark prolonged silence but don't stop recording yet
-		// Let user decide when to release keys
-		if r.speechState == WaitingForSpeech && r.silenceChunks >= r.maxSilenceChunks {
-			if !r.prolongedSilence {
-				r.prolongedSilence = true
-			}
-		}
-		r.recordingMutex.Unlock()
-
-		// Check again if we should stop before sending audio
-		select {
-		case <-r.stopChan:
-			return
-		default:
-		}
-
-		// Only send audio to API if speech has been detected or we haven't hit prolonged silence yet
-		// This avoids unnecessary API calls during prolonged silence periods
-		r.recordingMutex.Lock()
-		shouldSendAudio := r.speechState == SpeechDetected || !r.prolongedSilence
-		r.recordingMutex.Unlock()
-
-		if r.audioCallback != nil && shouldSendAudio {
-			// Send audio chunk to callback
-			if err := r.audioCallback(pcmBytes); err != nil {
-				// Check if stop was called before logging error
+			} else {
 				select {
 				case <-r.stopChan:
-					return
+					// Expected: Stop closed the stream out from under the read.
 				default:
 					r.recordingMutex.Lock()
-					stillRecording := r.recording
+					r.exitErr = fmt.Errorf("microphone read failed: %w", err)
 					r.recordingMutex.Unlock()
-
-					if stillRecording {
-						// Check if it's a WebSocket close error - if so, stop sending
-						errStr := err.Error()
-						if strings.Contains(errStr, "websocket: close sent") ||
-							strings.Contains(errStr, "use of closed network connection") ||
-							strings.Contains(errStr, "connection reset by peer") {
-							// WebSocket is closed, stop the audio stream
-							return
-						}
-						log.Printf("Error in audio callback: %v", err)
-					}
-					// Continue trying to send, don't break the loop (unless WebSocket is closed)
 				}
+				return
 			}
 		}
 
-		// Reduce delay to improve real-time performance
-		time.Sleep(10 * time.Millisecond)
+		for i, sample := range in {
+			pcm[i*2] = byte(sample)
+			pcm[i*2+1] = byte(sample >> 8)
+		}
+
+		chunkRMS := calculateRMS(in)
+
+		r.recordingMutex.Lock()
+		r.chunks++
+		if r.chunks > ignoreLeadingChunks && chunkRMS > r.maxRMS {
+			r.maxRMS = chunkRMS
+		}
+		r.recordingMutex.Unlock()
+
+		if r.audioCallback == nil {
+			continue
+		}
+
+		// Every captured chunk is sent. Withholding audio during leading silence
+		// used to be an optimisation for per-audio-second billing, but the API
+		// bills wall-clock session time, so it saved nothing and only made the
+		// stream discontinuous.
+		if err := r.audioCallback(pcm); err != nil {
+			select {
+			case <-r.stopChan:
+			default:
+				r.recordingMutex.Lock()
+				r.exitErr = err
+				r.recordingMutex.Unlock()
+			}
+			return
+		}
 	}
 }
 

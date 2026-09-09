@@ -15,14 +15,15 @@ import (
 const (
 	configFileName = "config.json"
 	configDirName  = "t2"
-	metricsSubDir  = "metrics"
 )
 
 // Config represents the application configuration
 type Config struct {
 	AssemblyAIKey string `json:"assemblyai_key"`
-	TypingSpeed   int    `json:"typing_speed,omitempty"` // User's typing speed in WPM
 }
+
+// GetConfigDir returns the user's config directory for T2.
+func GetConfigDir() (string, error) { return getConfigDir() }
 
 // getConfigDir returns the user's config directory for T2
 func getConfigDir() (string, error) {
@@ -139,10 +140,15 @@ func GetAPIKey() (string, error) {
 		return apiKey, nil
 	}
 
-	// Priority 2: .env file (current development setup)
-	if err := godotenv.Load(); err == nil {
-		if apiKey := os.Getenv("ASSEMBLYAI_API_KEY"); apiKey != "" {
-			return apiKey, nil
+	// A .env file used to be read from the *current working directory*, which
+	// meant running t2 inside another project silently billed that project's
+	// AssemblyAI account - and exported every other variable in that file into
+	// this process. Only this tool's own config directory is consulted now.
+	if dir, err := getConfigDir(); err == nil {
+		if err := godotenv.Load(filepath.Join(dir, ".env")); err == nil {
+			if apiKey := os.Getenv("ASSEMBLYAI_API_KEY"); apiKey != "" {
+				return apiKey, nil
+			}
 		}
 	}
 
@@ -184,14 +190,4 @@ func GetAPIKey() (string, error) {
 	}
 
 	return apiKey, nil
-}
-
-// GetMetricsDir returns the metrics directory path
-func GetMetricsDir() (string, error) {
-	configDir, err := getConfigDir()
-	if err != nil {
-		return "", err
-	}
-
-	return filepath.Join(configDir, metricsSubDir), nil
 }

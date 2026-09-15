@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -47,7 +48,85 @@ const (
 
 	dialTimeout  = 5 * time.Second
 	writeTimeout = 5 * time.Second
+
+	// Turn detection.
+	//
+	// The server splits speech into turns and formats each one as its own
+	// sentence, so where a turn ends is where a full stop and a capital
+	// letter go. With the API defaults - end the turn on any 1280ms pause,
+	// or on a shorter one once the model is 40% sure the speaker has
+	// finished - every thinking pause in a dictation became a full stop, and
+	// one continuous thought came out as a string of stubs: "When my voice.
+	// Is broken."
+	//
+	// t2 is push-to-talk. Releasing the key ends the last turn (Terminate
+	// finalises and formats it), so within a hold turns can be made hard to
+	// end, and the formatter then punctuates from the words rather than from
+	// the pauses. A genuinely long pause after a complete sentence still
+	// ends a turn.
+	maxTurnSilenceMS    = 5000 // a pause this long ends the turn regardless
+	minTurnSilenceMS    = 700  // no end-of-turn check before this much silence
+	endOfTurnConfidence = 0.85 // and only if the model is this sure the thought is complete
 )
+
+// Environment overrides for tuning pause tolerance to a speaking style.
+// T2_TURN_DEFAULTS=1 leaves turn detection to the server's defaults, which is
+// how the pause test shows the before and after.
+const (
+	maxTurnSilenceEnv      = "T2_MAX_TURN_SILENCE_MS"
+	minTurnSilenceEnv      = "T2_MIN_TURN_SILENCE_MS"
+	endOfTurnConfidenceEnv = "T2_END_OF_TURN_CONFIDENCE"
+	turnDefaultsEnv        = "T2_TURN_DEFAULTS"
+)
+
+// TurnDetection is the end-of-turn configuration a session is dialled with.
+type TurnDetection struct {
+	MaxTurnSilenceMS    int
+	MinTurnSilenceMS    int
+	EndOfTurnConfidence float64
+	ServerDefaults      bool
+}
+
+// CurrentTurnDetection reports the configuration Dial will use, after the
+// environment overrides.
+func CurrentTurnDetection() TurnDetection {
+	td := TurnDetection{
+		MaxTurnSilenceMS:    maxTurnSilenceMS,
+		MinTurnSilenceMS:    minTurnSilenceMS,
+		EndOfTurnConfidence: endOfTurnConfidence,
+	}
+	if os.Getenv(turnDefaultsEnv) != "" {
+		td.ServerDefaults = true
+		return td
+	}
+	if v, err := strconv.Atoi(os.Getenv(maxTurnSilenceEnv)); err == nil && v > 0 {
+		td.MaxTurnSilenceMS = v
+	}
+	if v, err := strconv.Atoi(os.Getenv(minTurnSilenceEnv)); err == nil && v > 0 {
+		td.MinTurnSilenceMS = v
+	}
+	if v, err := strconv.ParseFloat(os.Getenv(endOfTurnConfidenceEnv), 64); err == nil && v > 0 && v <= 1 {
+		td.EndOfTurnConfidence = v
+	}
+	return td
+}
+
+func (td TurnDetection) apply(q url.Values) {
+	if td.ServerDefaults {
+		return
+	}
+	q.Set("max_turn_silence", strconv.Itoa(td.MaxTurnSilenceMS))
+	q.Set("min_turn_silence", strconv.Itoa(td.MinTurnSilenceMS))
+	q.Set("end_of_turn_confidence_threshold", strconv.FormatFloat(td.EndOfTurnConfidence, 'f', 2, 64))
+}
+
+func (td TurnDetection) String() string {
+	if td.ServerDefaults {
+		return "server defaults (max_turn_silence 1280ms, end_of_turn_confidence_threshold 0.4)"
+	}
+	return fmt.Sprintf("max_turn_silence %dms, min_turn_silence %dms, end_of_turn_confidence_threshold %.2f",
+		td.MaxTurnSilenceMS, td.MinTurnSilenceMS, td.EndOfTurnConfidence)
+}
 
 // ErrSessionClosed reports that the session can no longer accept audio. Callers
 // classify with errors.Is rather than matching error strings.
@@ -116,6 +195,7 @@ func Dial(apiKey string, sampleRate int) (*Session, error) {
 	q.Set("speech_model", speechModel)
 	q.Set("format_turns", "true")
 	q.Set("inactivity_timeout", strconv.Itoa(inactivityTimeout))
+	CurrentTurnDetection().apply(q)
 	u.RawQuery = q.Encode()
 
 	// DefaultDialer has a 45s handshake timeout and no connect timeout, so a
@@ -304,9 +384,16 @@ func (s *Session) read() {
 	for {
 		_, data, err := s.conn.ReadMessage()
 		if err != nil {
+			// Keep the first error. The server sends an Error frame with the
+			// reason and then closes with a bare policy-violation code; the
+			// close used to overwrite the reason, so the user saw "close 1008
+			// (policy violation): See Error message for details" and never
+			// the message it referred to.
 			if !isExpectedClose(err) {
 				s.mu.Lock()
-				s.readErr = err
+				if s.readErr == nil {
+					s.readErr = err
+				}
 				s.mu.Unlock()
 			}
 			return

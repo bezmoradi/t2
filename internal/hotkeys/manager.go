@@ -2,12 +2,36 @@ package hotkeys
 
 import "time"
 
+// MaxHold is the longest a single hold may run. Past it the poller reports a
+// release while the keys are still down, then ignores them until they are
+// physically let go.
+//
+// Without a limit, a hold whose release never arrived - a modifier the HID
+// system believes is still down, which remote-desktop tools, VMs and flaky
+// keyboards all produce - kept the microphone open indefinitely, grew the
+// in-memory recording by ~115MB an hour, kept the session billed, and left
+// the daemon deaf to every later press until restart. Five minutes is longer
+// than any dictation and short enough that none of that matters.
+const MaxHold = 5 * time.Minute
+
+// Release describes how a hold ended.
+type Release struct {
+	// Held is how long the keys were actually down, measured from the poller's
+	// own edge timestamps rather than from wall-clock time inside the handler.
+	Held time.Duration
+
+	// Cancelled means another key went down during the hold - a shortcut such
+	// as Ctrl+Shift+T, not dictation - so the recording should be discarded.
+	Cancelled bool
+
+	// Capped means the hold reached MaxHold and the poller ended it while the
+	// keys were still down.
+	Capped bool
+}
+
 type EventHandler interface {
 	OnPress()
-	// OnRelease reports how long the key was actually held, measured from the
-	// poller's own edge timestamps rather than from wall-clock time inside the
-	// handler, and whether the hold was cancelled by another key going down.
-	OnRelease(held time.Duration, cancelled bool)
+	OnRelease(Release)
 }
 
 type Manager struct {

@@ -17,7 +17,7 @@ T2 is a CLI application written in Go that transforms your voice into text using
 Mac users need to run the following command to install the prerequisites:
 
 ```sh
-$ brew install portaudio pkg-config go
+$ brew install go
 ```
 
 ### Add Go to Your PATH

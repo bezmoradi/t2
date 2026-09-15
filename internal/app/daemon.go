@@ -1,10 +1,12 @@
 package app
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -31,7 +33,23 @@ const (
 	// beginTimeout bounds the wait for the server to confirm the session
 	// before streaming buffered audio at it.
 	beginTimeout = 5 * time.Second
+
+	// flushTimeout bounds the wait, after the key is released, for audio the
+	// sender has not yet delivered. It is normally zero: audio streams live.
+	// It is only ever long when the dial was slow and the backlog is large, or
+	// the network has stalled, in which case the server transcribes what it got.
+	flushTimeout = 3 * time.Second
+
+	// restartLimit within restartWindow is where automatic restarts stop, so a
+	// broken audio setup cannot make t2 restart after every recording forever.
+	restartLimit  = 3
+	restartWindow = time.Hour
 )
+
+// restartGrace is how long a wedged process waits before restarting itself,
+// in case the stream shutdown was merely slow and completes after all. A
+// variable so tests can shorten it.
+var restartGrace = 10 * time.Second
 
 type dialResult struct {
 	session *transcription.Session
@@ -45,6 +63,21 @@ type Daemon struct {
 	apiKey        string
 	verbose       bool
 
+	// paste delivers a transcript to the active application, and copy only
+	// puts it on the clipboard. Fields so the soak test can run the whole
+	// pipeline without typing into whatever window happens to be focused.
+	paste func(string) error
+	copy  func(string) error
+
+	// restart replaces the process after the audio layer has wedged. A field
+	// for the same reason: the soak test must not re-exec itself.
+	restart func()
+
+	// beep and dial are fields so tests can run the daemon silently and
+	// without a network.
+	beep func(string)
+	dial func(apiKey string, sampleRate int) (*transcription.Session, error)
+
 	dialDone  chan dialResult
 	listenEnd chan struct{}
 }
@@ -53,6 +86,11 @@ func NewDaemon(verbose bool) *Daemon {
 	return &Daemon{
 		sink:      newAudioSink(),
 		verbose:   verbose,
+		paste:     clipboard.PasteTextSafely,
+		copy:      clipboard.CopyText,
+		restart:   restartProcess,
+		beep:      audio.PlayBeep,
+		dial:      transcription.Dial,
 		listenEnd: make(chan struct{}),
 	}
 }
@@ -66,10 +104,6 @@ func (d *Daemon) Initialize() error {
 
 	d.recorder = audio.NewRecorder(d.sink.write)
 	d.hotkeyManager = hotkeys.NewManager(d)
-
-	if err := audio.Initialize(); err != nil {
-		return fmt.Errorf("failed to initialize PortAudio: %v", err)
-	}
 
 	// No session is opened here. AssemblyAI bills the wall-clock time a
 	// connection stays open, so a session dialled at startup and left idle
@@ -105,8 +139,7 @@ func (d *Daemon) Run() error {
 
 func (d *Daemon) Cleanup() {
 	// Stop feeding the handler, then let any in-flight recording finish, so we
-	// do not tear PortAudio down underneath a running capture or abandon a
-	// session that is still being billed.
+	// do not abandon a session that is still being billed.
 	if d.hotkeyManager != nil {
 		d.hotkeyManager.Stop()
 		select {
@@ -118,8 +151,6 @@ func (d *Daemon) Cleanup() {
 	if d.recorder != nil {
 		d.recorder.Stop()
 	}
-
-	audio.Terminate()
 }
 
 // OnPress implements hotkeys.EventHandler
@@ -128,14 +159,27 @@ func (d *Daemon) OnPress() {
 		return
 	}
 
-	audio.PlayBeep("start")
+	// A press while the audio layer is wedged: nothing can be recorded, so
+	// there is no point waiting out the restart grace period, and no beep
+	// either - a beep player still alive at exec would be left as a zombie.
+	if audio.Wedged() {
+		d.restart()
+		return
+	}
+
+	d.beep("start")
 
 	// Capture first, dial second. The handshake costs 60-140ms of TLS plus an
 	// HTTP upgrade; if capture waited for it, every recording would lose its
 	// opening syllable. Audio buffers in the sink until the session is ready.
-	d.sink.reset()
+	d.sink.start()
 	if err := d.recorder.Start(); err != nil {
+		d.sink.stop()
 		fmt.Printf("❌ Could not start recording: %v\n", err)
+		if errors.Is(err, audio.ErrWedged) {
+			d.restart()
+			return
+		}
 		fmt.Println("   Check that this terminal has Microphone permission.")
 		fmt.Println()
 		return
@@ -145,7 +189,7 @@ func (d *Daemon) OnPress() {
 	go func(done chan dialResult) {
 		started := time.Now()
 
-		session, err := transcription.Dial(d.apiKey, audio.SampleRate)
+		session, err := d.dial(d.apiKey, audio.SampleRate)
 		if err != nil {
 			done <- dialResult{err: err}
 			return
@@ -166,13 +210,32 @@ func (d *Daemon) OnPress() {
 }
 
 // OnRelease implements hotkeys.EventHandler
-func (d *Daemon) OnRelease(held time.Duration, cancelled bool) {
+func (d *Daemon) OnRelease(rel hotkeys.Release) {
 	if !d.recorder.IsRecording() {
 		return
 	}
 
+	// The beep answers the key release, so it goes before the stop: a wedged
+	// stop takes seconds to give up, and that used to sound like no beep.
+	d.beep("stop")
 	outcome := d.recorder.Stop()
-	audio.PlayBeep("stop")
+
+	// Whatever happens below, the sender must not outlive this recording.
+	defer d.sink.stop()
+
+	if outcome.Wedged {
+		// The audio is intact; only the shutdown hung. Finish this recording
+		// first - transcript pasted, session closed - then deal with it.
+		defer d.scheduleRestart()
+	}
+
+	if rel.Capped {
+		// The poller ended the hold with the keys still down. Said before the
+		// result, on every path, so that a modifier stuck in the down state -
+		// which produces exactly this once and then silence - is explained
+		// rather than mysterious.
+		fmt.Printf("⏱  Hold reached the %v limit - recording stopped. Release the keys, then press again to continue.\n", hotkeys.MaxHold)
+	}
 
 	// The dial may still be in flight; it owns the session either way.
 	result := <-d.dialDone
@@ -190,35 +253,50 @@ func (d *Daemon) OnRelease(held time.Duration, cancelled bool) {
 	// Every path from here closes the session. One left open stays billed
 	// until the server's 3-hour cap.
 
-	if cancelled {
+	if rel.Cancelled {
 		session.Discard()
 		fmt.Println("⌨️  Shortcut detected - skipped")
 		fmt.Println()
 		return
 	}
 
-	if held < quickPressThreshold {
+	if rel.Held < quickPressThreshold {
 		session.Discard()
-		fmt.Printf("⚡ Quick press (%v) - skipped\n", held.Round(time.Millisecond))
+		fmt.Printf("⚡ Quick press (%v) - skipped\n", rel.Held.Round(time.Millisecond))
 		fmt.Println()
 		return
 	}
 
-	if maxRMS := d.recorder.GetMaxRMS(); maxRMS < audio.SilenceThreshold {
+	if outcome.Chunks == 0 {
+		// A silent room still produces chunks. None at all means the device
+		// ran no IO: the wrong input selected, or one that is gone.
 		session.Discard()
-		fmt.Printf("🔇 No speech detected - skipped (level %.0f, threshold %.0f)\n",
-			maxRMS, audio.SilenceThreshold)
+		fmt.Println("❌ The microphone delivered no audio - check the input device under System Settings > Sound")
 		fmt.Println()
 		return
 	}
+
+	if outcome.MaxRMS < audio.SilenceThreshold {
+		session.Discard()
+		fmt.Printf("🔇 No speech detected - skipped (level %.0f, threshold %.0f)\n",
+			outcome.MaxRMS, audio.SilenceThreshold)
+		fmt.Println()
+		return
+	}
+
+	// Everything captured has to reach the server before Terminate, or the
+	// end of the recording is never transcribed. Then the sender is stopped so
+	// nothing is written to the socket after Terminate.
+	d.sink.flush(flushTimeout)
+	d.sink.stop()
 
 	transcript := session.Finish(terminationTimeout)
 
 	d.logf("held %v, %d chunks, %d overflow(s), model %q, audio %.1fs, billed %.1fs",
-		held.Round(time.Millisecond), outcome.Chunks, outcome.Overflows,
+		rel.Held.Round(time.Millisecond), outcome.Chunks, outcome.Overflows,
 		transcript.Model, transcript.AudioSeconds, transcript.SessionSeconds)
 
-	d.report(transcript, outcome)
+	d.report(transcript, outcome, rel.Capped)
 }
 
 // report pastes the transcript and says plainly what was produced.
@@ -226,7 +304,7 @@ func (d *Daemon) OnRelease(held time.Duration, cancelled bool) {
 // The old code printed a green check for any non-empty text, so a truncated
 // capture, a dropped connection and an unformatted partial all looked like
 // success. Anything short of a clean formatted result now says so.
-func (d *Daemon) report(t transcription.Result, outcome audio.Outcome) {
+func (d *Daemon) report(t transcription.Result, outcome audio.Outcome, capped bool) {
 	defer fmt.Println()
 
 	sendErr := d.sink.err()
@@ -243,7 +321,20 @@ func (d *Daemon) report(t transcription.Result, outcome audio.Outcome) {
 		return
 	}
 
-	if err := clipboard.PasteTextSafely(t.Text); err != nil {
+	if capped {
+		// The keys are still physically down: a synthesised Cmd+V would arrive
+		// as Ctrl+Shift+Cmd+V and do who knows what in the focused app. Copy
+		// only, and let the user paste once they let go.
+		if err := d.copy(t.Text); err != nil {
+			fmt.Printf("❌ Copy failed: %v\n", err)
+		} else {
+			fmt.Println("📋 Copied to the clipboard - release the keys, then press Cmd+V to paste")
+		}
+		fmt.Printf("   %s\n", t.Text)
+		return
+	}
+
+	if err := d.paste(t.Text); err != nil {
 		fmt.Printf("❌ Paste failed: %v\n", err)
 		fmt.Printf("   Transcript: %s\n", t.Text)
 		return
@@ -297,6 +388,81 @@ func (d *Daemon) saveAudio() {
 	}
 
 	fmt.Printf("   Audio saved to %s\n", path)
+}
+
+// scheduleRestart deals with a wedged audio layer once the recording that hit
+// it has been reported. It waits out a grace period first: a stop that was
+// merely slow completes in that time and nothing needs to happen, while a
+// press during the wait restarts at once (see OnPress).
+func (d *Daemon) scheduleRestart() {
+	grace := restartGrace
+	fmt.Printf("⚠️  The microphone did not shut down (CoreAudio hang). Restarting t2 in %v unless it recovers...\n", grace)
+	fmt.Println()
+
+	go func() {
+		deadline := time.Now().Add(grace)
+		for time.Now().Before(deadline) {
+			if !audio.Wedged() {
+				fmt.Println("✅ The microphone shut down after all - no restart needed")
+				fmt.Println()
+				return
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+		d.restart()
+	}()
+}
+
+// Environment markers that survive the exec, so a restart loop can be noticed.
+const (
+	restartCountEnv = "T2_RESTART_COUNT"
+	restartLastEnv  = "T2_RESTART_LAST"
+)
+
+// restartProcess replaces the process with a fresh copy of itself.
+//
+// This is the recovery for the CoreAudio deadlock described at
+// audio.Recorder.Stop. Once a stream is stuck in it, nothing on that device
+// can be started again in this process, so a restart is the only way back to
+// a working microphone. Doing it here, automatically, turns what used to be
+// "t2 silently stops responding until you notice and restart it" into a few
+// seconds' pause and a line of output. The recording that hit the deadlock
+// has already been transcribed and pasted by the time this runs.
+//
+// It gives up after restartLimit restarts within restartWindow: past that the
+// deadlock is not the occasional race it is meant for but something broken,
+// and restarting after every recording would only hide it.
+func restartProcess() {
+	count, _ := strconv.Atoi(os.Getenv(restartCountEnv))
+	last, _ := strconv.ParseInt(os.Getenv(restartLastEnv), 10, 64)
+	if time.Since(time.Unix(last, 0)) > restartWindow {
+		count = 0
+	}
+	count++
+
+	if count > restartLimit {
+		fmt.Printf("❌ The audio layer deadlocked again - %d restarts in the last hour, so not restarting automatically any more.\n", count-1)
+		fmt.Println("   Please restart t2 by hand, and report this if it keeps happening.")
+		fmt.Println()
+		return
+	}
+
+	fmt.Println("🔁 The audio layer hung inside CoreAudio. Restarting t2 automatically...")
+	fmt.Println()
+
+	os.Setenv(restartCountEnv, strconv.Itoa(count))
+	os.Setenv(restartLastEnv, strconv.FormatInt(time.Now().Unix(), 10))
+
+	exe, err := os.Executable()
+	if err == nil {
+		// Exec only returns on failure. Every thread, the stuck one included,
+		// dies with the old image; the new process starts clean.
+		err = syscall.Exec(exe, os.Args, os.Environ())
+	}
+
+	fmt.Printf("❌ Automatic restart failed: %v\n", err)
+	fmt.Println("   Please restart t2 by hand.")
+	fmt.Println()
 }
 
 func (d *Daemon) logf(format string, args ...any) {

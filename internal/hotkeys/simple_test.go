@@ -4,6 +4,7 @@ package hotkeys
 
 import (
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -13,8 +14,7 @@ type spyHandler struct {
 	recording bool
 	presses   int
 	releases  int
-	lastHeld  time.Duration
-	lastCanc  bool
+	lastRel   Release
 	slow      time.Duration
 }
 
@@ -26,12 +26,11 @@ func (h *spyHandler) OnPress() {
 	time.Sleep(h.slow) // OnPress really does take a few hundred ms
 }
 
-func (h *spyHandler) OnRelease(held time.Duration, cancelled bool) {
+func (h *spyHandler) OnRelease(rel Release) {
 	h.mu.Lock()
 	h.recording = false
 	h.releases++
-	h.lastHeld = held
-	h.lastCanc = cancelled
+	h.lastRel = rel
 	h.mu.Unlock()
 }
 
@@ -39,6 +38,12 @@ func (h *spyHandler) snapshot() (bool, int, int) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.recording, h.presses, h.releases
+}
+
+func (h *spyHandler) last() Release {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.lastRel
 }
 
 // Edges arriving faster than the handler can process them must still pair up.
@@ -91,15 +96,12 @@ func TestHoldDurationComesFromEdgeTimestamps(t *testing.T) {
 	s.events <- edge{pressed: false, at: press.Add(1500 * time.Millisecond)}
 
 	waitFor(t, func() bool {
-		h.mu.Lock()
-		defer h.mu.Unlock()
-		return h.releases == 1
+		_, _, releases := h.snapshot()
+		return releases == 1
 	})
 
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.lastHeld != 1500*time.Millisecond {
-		t.Errorf("held = %v, want exactly 1.5s from the edge timestamps", h.lastHeld)
+	if held := h.last().Held; held != 1500*time.Millisecond {
+		t.Errorf("held = %v, want exactly 1.5s from the edge timestamps", held)
 	}
 }
 
@@ -117,16 +119,89 @@ func TestCancelledHoldIsReported(t *testing.T) {
 	s.events <- edge{pressed: false, at: now.Add(time.Second), cancelled: true}
 
 	waitFor(t, func() bool {
-		h.mu.Lock()
-		defer h.mu.Unlock()
-		return h.releases == 1
+		_, _, releases := h.snapshot()
+		return releases == 1
 	})
 
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if !h.lastCanc {
+	if !h.last().Cancelled {
 		t.Error("cancelled hold was not reported as cancelled")
 	}
+}
+
+// A release produced at the hold limit is reported as capped, so the daemon
+// can tell the user why the recording ended with the keys still down.
+func TestCappedReleaseIsReported(t *testing.T) {
+	h := &spyHandler{}
+	s := NewSimpleManager(h)
+
+	go s.Listen()
+	defer s.Stop()
+
+	now := time.Now()
+	s.events <- edge{pressed: true, at: now}
+	s.events <- edge{pressed: false, at: now.Add(MaxHold), capped: true}
+
+	waitFor(t, func() bool {
+		_, _, releases := h.snapshot()
+		return releases == 1
+	})
+
+	if rel := h.last(); !rel.Capped || rel.Held != MaxHold {
+		t.Errorf("got %+v, want a capped release held for %v", rel, MaxHold)
+	}
+}
+
+// A hold that reaches the limit is released by the poller itself, and the keys
+// are then ignored until they physically come up: no second recording may
+// start off a modifier that is stuck down, and the eventual real release must
+// not be reported a second time. Only a fresh press starts a new hold.
+func TestHoldIsCappedAndKeysIgnoredUntilReleased(t *testing.T) {
+	var down atomic.Bool
+	h := &spyHandler{}
+	s := NewSimpleManager(h)
+	s.hotkeyDown = down.Load
+	s.otherDown = func() bool { return false }
+	s.maxHold = 300 * time.Millisecond
+
+	if err := s.Start(); err != nil {
+		t.Fatal(err)
+	}
+	go s.Listen()
+	defer s.Stop()
+
+	down.Store(true)
+	waitFor(t, func() bool {
+		_, _, releases := h.snapshot()
+		return releases == 1
+	})
+
+	rel := h.last()
+	if !rel.Capped {
+		t.Fatal("release at the limit was not reported as capped")
+	}
+	if rel.Held < s.maxHold {
+		t.Errorf("held = %v, want at least the %v limit", rel.Held, s.maxHold)
+	}
+
+	// Keys still down: nothing further may happen.
+	time.Sleep(4 * pollInterval)
+	if _, presses, releases := h.snapshot(); presses != 1 || releases != 1 {
+		t.Fatalf("keys still down after the cap: presses=%d releases=%d, want 1 and 1", presses, releases)
+	}
+
+	// The physical release was already reported at the limit.
+	down.Store(false)
+	time.Sleep(4 * pollInterval)
+	if _, presses, releases := h.snapshot(); presses != 1 || releases != 1 {
+		t.Fatalf("after the physical release: presses=%d releases=%d, want 1 and 1", presses, releases)
+	}
+
+	// A fresh press is a new hold.
+	down.Store(true)
+	waitFor(t, func() bool {
+		_, presses, _ := h.snapshot()
+		return presses == 2
+	})
 }
 
 // A release with no press in flight must not close out the next press.

@@ -4,9 +4,11 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
+	"strconv"
 	"sync"
-
-	"github.com/gordonklaus/portaudio"
+	"sync/atomic"
+	"time"
 )
 
 const (
@@ -25,54 +27,110 @@ const (
 	ignoreLeadingChunks = 3
 )
 
+// Timeouts are variables so tests can shorten them.
+var (
+	// pollInterval is how long the capture loop waits when the device has
+	// less than one chunk ready. Every wait happens here, in Go, where Stop
+	// can interrupt it; the loop never blocks inside the audio layer.
+	pollInterval = 5 * time.Millisecond
+
+	// starvationTimeout is how long the loop tolerates no audio at all, once
+	// audio has started, before declaring the device gone. A live device
+	// fills a chunk every 64ms.
+	starvationTimeout = 2 * time.Second
+
+	// stopTimeout bounds how long Stop waits for the capture loop to notice
+	// the stop. The loop only ever appends to the sink, so nothing legitimate
+	// holds it beyond one poll interval.
+	stopTimeout = 2 * time.Second
+
+	// shutdownTimeout bounds how long Stop then waits for the stream to
+	// close, which takes milliseconds. Anything near this is the audio layer
+	// hanging inside the OS, and waiting longer only delays the recovery.
+	shutdownTimeout = 3 * time.Second
+)
+
+// ErrWedged reports that a previous recording's stream never shut down, so
+// this process's audio layer is unusable until the process restarts.
+var ErrWedged = errors.New("the audio layer is stuck inside CoreAudio; t2 has to restart")
+
+// Stream is one open capture from the default microphone: mono int16 at
+// SampleRate. OpenStream provides the platform's implementation.
+type Stream interface {
+	// Available reports how many frames can be read without blocking.
+	Available() (int, error)
+
+	// Read fills into with exactly len(into) frames. It is only called once
+	// Available has reported at least that many, so it never blocks.
+	Read(into []int16) error
+
+	// Overflows reports how many times audio was dropped because it was not
+	// read fast enough.
+	Overflows() int
+
+	// Close stops the capture and releases the device. It may hang inside
+	// the OS; Stop bounds the wait.
+	Close() error
+}
+
+// framesPerBuffer is the chunk size requested from the device. A variable so
+// tests can shrink it: a tiny buffer multiplies the device's IO cycles and
+// stop handshakes, which is what made PortAudio's CoreAudio deadlock
+// reproducible in seconds and is how the replacement is stress-tested.
+var framesPerBuffer = Frames
+
+// framesEnv overrides framesPerBuffer for diagnostics, e.g.
+// T2_FRAMES_PER_BUFFER=32 on the real binary.
+const framesEnv = "T2_FRAMES_PER_BUFFER"
+
+func chunkFrames() int {
+	if v, err := strconv.Atoi(os.Getenv(framesEnv)); err == nil && v > 0 {
+		return v
+	}
+	return framesPerBuffer
+}
+
 // Outcome describes how a recording ended. Anything other than a clean stop
 // means the audio is incomplete, and the caller must not report success.
 type Outcome struct {
 	// Err is set when capture stopped on its own before Stop was called.
 	Err error
 
-	// Overflows counts chunks where PortAudio discarded input before we read
-	// it. The data in those chunks is still valid; the audio has a gap.
+	// Overflows counts times the device discarded input before we read it.
+	// The data around them is still valid; the audio has gaps.
 	Overflows int
 
 	// Chunks is how many audio chunks were captured.
 	Chunks int
+
+	// MaxRMS is the level of the loudest chunk after the leading ones, for
+	// the silence gate.
+	MaxRMS float64
+
+	// Wedged means the stream could not be shut down: the audio layer hung
+	// inside the OS. The audio itself was captured in full, but this process
+	// cannot record again until it restarts. See Stop.
+	Wedged bool
 }
 
 // Incomplete reports whether the recording ended early or lost audio.
 func (o Outcome) Incomplete() bool { return o.Err != nil || o.Overflows > 0 }
 
+// Recorder captures from the default microphone, one recording at a time.
 type Recorder struct {
-	recording      bool
-	stream         *portaudio.Stream
-	recordingMutex sync.Mutex
-	audioCallback  func([]byte) error
-	stopChan       chan struct{}
-	streamWg       sync.WaitGroup
-
-	maxRMS    float64
-	chunks    int
-	overflows int
-	exitErr   error
+	mu      sync.Mutex
+	send    func([]byte) error
+	current *capture // in-flight recording; nil when idle
 }
 
 func NewRecorder(audioCallback func([]byte) error) *Recorder {
-	return &Recorder{
-		audioCallback: audioCallback,
-		stopChan:      make(chan struct{}),
-	}
+	return &Recorder{send: audioCallback}
 }
 
 func (r *Recorder) IsRecording() bool {
-	r.recordingMutex.Lock()
-	defer r.recordingMutex.Unlock()
-	return r.recording
-}
-
-func (r *Recorder) GetMaxRMS() float64 {
-	r.recordingMutex.Lock()
-	defer r.recordingMutex.Unlock()
-	return r.maxRMS
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.current != nil
 }
 
 // calculateRMS computes the Root Mean Square of int16 audio samples
@@ -89,132 +147,201 @@ func calculateRMS(samples []int16) float64 {
 }
 
 func (r *Recorder) Start() error {
-	r.recordingMutex.Lock()
-	defer r.recordingMutex.Unlock()
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
-	if r.recording {
+	if r.current != nil {
 		return nil
 	}
 
-	// Reset per-recording state.
-	r.maxRMS = 0.0
-	r.chunks = 0
-	r.overflows = 0
-	r.exitErr = nil
-	r.stopChan = make(chan struct{})
+	if abandoned.Load() > 0 {
+		return ErrWedged
+	}
 
-	// Capture straight into int16: it is what AssemblyAI wants on the wire and
-	// what the RMS maths needs, so nothing has to be converted per chunk.
-	in := make([]int16, Frames)
-
-	stream, err := portaudio.OpenDefaultStream(1, 0, SampleRate, len(in), in)
+	// The stream is opened fresh for every recording, on whatever the
+	// default microphone is right now. There is no device list to refresh:
+	// a headset, AirPods or a conferencing app's virtual device that became
+	// the default since the last recording is simply what gets opened.
+	frames := chunkFrames()
+	stream, err := OpenStream(SampleRate, frames)
 	if err != nil {
-		return fmt.Errorf("opening microphone: %w", err)
+		return err
 	}
 
-	if err := stream.Start(); err != nil {
-		stream.Close()
-		return fmt.Errorf("starting microphone: %w", err)
+	c := &capture{
+		stream:   stream,
+		in:       make([]int16, frames),
+		send:     r.send,
+		stop:     make(chan struct{}),
+		loopDone: make(chan struct{}),
+		done:     make(chan struct{}),
 	}
-
-	r.stream = stream
-	r.recording = true
-
-	r.streamWg.Add(1)
-	go r.audioStreamLoop(in)
+	r.current = c
+	go c.run()
 
 	return nil
 }
 
 // Stop ends capture and reports how the recording actually went.
 func (r *Recorder) Stop() Outcome {
-	r.recordingMutex.Lock()
+	r.mu.Lock()
+	c := r.current
+	r.current = nil
+	r.mu.Unlock()
 
-	if !r.recording {
-		r.recordingMutex.Unlock()
+	if c == nil {
 		return Outcome{}
 	}
 
-	r.recording = false
-	close(r.stopChan)
-	r.recordingMutex.Unlock()
+	close(c.stop)
 
-	// Wait for the audio goroutine before touching the stream.
-	r.streamWg.Wait()
-
-	r.recordingMutex.Lock()
-	defer r.recordingMutex.Unlock()
-
-	if r.stream != nil {
-		r.stream.Stop()
-		r.stream.Close()
-		r.stream = nil
+	// Two waits, because the two things that can hold the goroutine up are
+	// different in kind. The loop can only be a poll interval away from
+	// noticing. Closing the stream takes milliseconds unless the audio layer
+	// has hung inside the OS, in which case it never returns, so that wait
+	// is short: the sooner it gives up, the sooner the daemon can restart
+	// the process, which is the only way out of a wedged audio layer.
+	//
+	// This watchdog outlived the backend it was written for. PortAudio's
+	// CoreAudio backend deadlocked in Pa_StopStream: AUHAL's stop handshake
+	// gives the IO thread ~10 IO buffers to acknowledge a stop, and when it
+	// was late - under coreaudiod load from other clients starting up -
+	// AudioOutputUnitStop called AudioDeviceStop itself while holding the
+	// AudioUnit's mutex, needing the IO mutex the IO thread held while it ran
+	// PortAudio's IsRunning listener, which needed the AudioUnit's mutex. The
+	// old code waited on it with no timeout, so one occurrence left the
+	// daemon deaf until someone restarted it. AudioQueue has no such
+	// listener, but a stop that hangs inside the OS is still worth catching.
+	select {
+	case <-c.loopDone:
+	case <-time.After(stopTimeout):
+		return r.abandon(c)
 	}
 
-	return Outcome{Err: r.exitErr, Overflows: r.overflows, Chunks: r.chunks}
+	select {
+	case <-c.done:
+	case <-time.After(shutdownTimeout):
+		return r.abandon(c)
+	}
+
+	return c.outcome()
 }
 
-func (r *Recorder) audioStreamLoop(in []int16) {
-	defer func() {
-		// A panic here used to be swallowed while leaving the recorder marked as
-		// recording, so the failure surfaced as a silently truncated transcript.
-		if p := recover(); p != nil {
-			r.recordingMutex.Lock()
-			r.exitErr = fmt.Errorf("capture panicked: %v", p)
-			r.recordingMutex.Unlock()
-		}
-		r.streamWg.Done()
+// abandon gives up on a capture stuck inside the audio layer. The capture owns
+// its own state and stream, so nothing it does later can reach the next
+// recording; Start refuses until it returns, which for a real hang is never.
+func (r *Recorder) abandon(c *capture) Outcome {
+	r.mu.Lock()
+	abandoned.Add(1)
+	r.mu.Unlock()
+
+	go func() {
+		<-c.done
+		r.mu.Lock()
+		abandoned.Add(-1)
+		r.mu.Unlock()
 	}()
 
-	pcm := make([]byte, len(in)*2)
+	out := c.outcome()
+	out.Wedged = true
+	return out
+}
+
+// capture is one recording. The goroutine that reads the device owns it - the
+// stream included, which it closes itself on the way out - so that a capture
+// Stop had to give up on can never touch the recorder or the next recording.
+type capture struct {
+	stream Stream
+	in     []int16
+	send   func([]byte) error
+
+	stop     chan struct{} // closed by Stop
+	loopDone chan struct{} // closed by run once the loop has exited
+	done     chan struct{} // closed by run on exit, once the stream is closed
+
+	mu        sync.Mutex
+	maxRMS    float64
+	chunks    int
+	overflows int
+	err       error
+}
+
+func (c *capture) run() {
+	defer close(c.done)
+	defer func() {
+		// A panic here used to be swallowed while leaving the recorder marked
+		// as recording, so the failure surfaced as a silently truncated
+		// transcript.
+		if p := recover(); p != nil {
+			c.fail(fmt.Errorf("capture panicked: %v", p))
+		}
+		close(c.loopDone)
+
+		// Only this goroutine ever touches the stream, so Stop never has to
+		// close it underneath a read. A close error changes nothing about the
+		// audio already captured, so it is not reported as one.
+		c.stream.Close()
+	}()
+
+	c.loop()
+}
+
+func (c *capture) loop() {
+	pcm := make([]byte, len(c.in)*2)
+
+	// Armed by the first chunk. Starvation means the device runs no IO
+	// cycles at all, which is a different thing from silence and from a slow
+	// start: a Bluetooth microphone can pause IO for longer than the timeout
+	// while it switches profiles, and every recording on it would otherwise
+	// fail.
+	var lastAudio time.Time
 
 	for {
 		select {
-		case <-r.stopChan:
+		case <-c.stop:
 			return
 		default:
 		}
 
-		// Read blocks until a full buffer is available, which is the loop's
-		// pacing. There is no sleep here on purpose: sleeping only eats the
-		// headroom in PortAudio's ring buffer and causes the overflows below.
-		if err := r.stream.Read(); err != nil {
-			// paInputOverflowed is reported alongside a full, valid buffer: it
-			// means input was discarded before this call, not that the read
-			// failed. Treating it as fatal killed capture mid-sentence and the
-			// tool still reported success.
-			if errors.Is(err, portaudio.InputOverflowed) {
-				r.recordingMutex.Lock()
-				r.overflows++
-				r.recordingMutex.Unlock()
-			} else {
-				select {
-				case <-r.stopChan:
-					// Expected: Stop closed the stream out from under the read.
-				default:
-					r.recordingMutex.Lock()
-					r.exitErr = fmt.Errorf("microphone read failed: %w", err)
-					r.recordingMutex.Unlock()
-				}
+		// Only ever read a chunk that is already there, so the loop never
+		// blocks inside the audio layer and a device that stops delivering
+		// is visible instead of indistinguishable from a quiet room.
+		avail, err := c.stream.Available()
+		if err != nil {
+			c.fail(fmt.Errorf("microphone read failed: %w", err))
+			return
+		}
+		if avail < len(c.in) {
+			if !lastAudio.IsZero() && time.Since(lastAudio) > starvationTimeout {
+				c.fail(errors.New("microphone stopped delivering audio"))
 				return
 			}
+			time.Sleep(pollInterval)
+			continue
+		}
+		lastAudio = time.Now()
+
+		if err := c.stream.Read(c.in); err != nil {
+			c.fail(fmt.Errorf("microphone read failed: %w", err))
+			return
 		}
 
-		for i, sample := range in {
+		for i, sample := range c.in {
 			pcm[i*2] = byte(sample)
 			pcm[i*2+1] = byte(sample >> 8)
 		}
 
-		chunkRMS := calculateRMS(in)
+		rms := calculateRMS(c.in)
 
-		r.recordingMutex.Lock()
-		r.chunks++
-		if r.chunks > ignoreLeadingChunks && chunkRMS > r.maxRMS {
-			r.maxRMS = chunkRMS
+		c.mu.Lock()
+		c.chunks++
+		if c.chunks > ignoreLeadingChunks && rms > c.maxRMS {
+			c.maxRMS = rms
 		}
-		r.recordingMutex.Unlock()
+		c.overflows = c.stream.Overflows()
+		c.mu.Unlock()
 
-		if r.audioCallback == nil {
+		if c.send == nil {
 			continue
 		}
 
@@ -222,25 +349,31 @@ func (r *Recorder) audioStreamLoop(in []int16) {
 		// used to be an optimisation for per-audio-second billing, but the API
 		// bills wall-clock session time, so it saved nothing and only made the
 		// stream discontinuous.
-		if err := r.audioCallback(pcm); err != nil {
-			select {
-			case <-r.stopChan:
-			default:
-				r.recordingMutex.Lock()
-				r.exitErr = err
-				r.recordingMutex.Unlock()
-			}
+		if err := c.send(pcm); err != nil {
+			c.fail(err)
 			return
 		}
 	}
 }
 
-// Initialize initializes PortAudio - should be called at application startup
-func Initialize() error {
-	return portaudio.Initialize()
+func (c *capture) fail(err error) {
+	c.mu.Lock()
+	if c.err == nil {
+		c.err = err
+	}
+	c.mu.Unlock()
 }
 
-// Terminate terminates PortAudio - should be called at application shutdown
-func Terminate() {
-	portaudio.Terminate()
+func (c *capture) outcome() Outcome {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return Outcome{Err: c.err, Overflows: c.overflows, Chunks: c.chunks, MaxRMS: c.maxRMS}
 }
+
+// abandoned counts capture goroutines that never came back from the audio
+// layer.
+var abandoned atomic.Int32
+
+// Wedged reports whether a capture is stuck inside the audio layer, which
+// makes it unusable for this process until the process restarts.
+func Wedged() bool { return abandoned.Load() > 0 }

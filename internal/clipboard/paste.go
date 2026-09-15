@@ -7,17 +7,25 @@ import (
 	"time"
 )
 
-// PasteTextSafely copies text to clipboard and pastes it using AppleScript
-func PasteTextSafely(text string) error {
+// CopyText puts text on the clipboard without pasting it.
+func CopyText(text string) error {
 	if text == "" {
 		return fmt.Errorf("empty text")
 	}
 
-	// Copy text to clipboard using macOS pbcopy command
 	cmd := exec.Command("pbcopy")
 	cmd.Stdin = strings.NewReader(text)
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("failed to copy to clipboard: %v", err)
+	}
+
+	return nil
+}
+
+// PasteTextSafely copies text to clipboard and pastes it using AppleScript
+func PasteTextSafely(text string) error {
+	if err := CopyText(text); err != nil {
+		return err
 	}
 
 	// Small delay to ensure clipboard is set

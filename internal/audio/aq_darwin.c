@@ -1,3 +1,5 @@
+//go:build darwin && cgo
+
 // Microphone capture through AudioQueue, mono int16 at the requested rate.
 //
 // The queue converts from the device's native rate itself, delivers buffers on
@@ -54,12 +56,21 @@ static void t2_free(t2_stream *s) {
 
 t2_stream *t2_stream_open(int sampleRate, int frames, int *status) {
 	t2_stream *s = calloc(1, sizeof(*s));
+	if (s == NULL) {
+		*status = T2_ERR_NOMEM;
+		return NULL;
+	}
 	pthread_mutex_init(&s->mu, NULL);
 	s->cap = (size_t)frames * 16;
 	if (s->cap < T2_MIN_RING) {
 		s->cap = T2_MIN_RING;
 	}
 	s->ring = calloc(s->cap, sizeof(int16_t));
+	if (s->ring == NULL) {
+		*status = T2_ERR_NOMEM;
+		t2_free(s);
+		return NULL;
+	}
 
 	AudioStreamBasicDescription fmt;
 	memset(&fmt, 0, sizeof fmt);

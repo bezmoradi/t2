@@ -34,6 +34,15 @@ func main() {
 		return
 	}
 
+	// Before anything else that touches the config: a second daemon would
+	// paste every dictation twice, and --reset-key from it would delete the
+	// running one's key.
+	lock, err := app.LockInstance()
+	if err != nil {
+		log.Fatalf("%v", err)
+	}
+	defer lock.Close()
+
 	if *resetKey {
 		handleResetKey()
 	}
@@ -85,15 +94,16 @@ func handleShowConfig() {
 
 	// The key is masked rather than printed. This is the natural command to run
 	// when asking someone for help, and it used to dump the API key verbatim.
-	var cfg struct {
-		AssemblyAIKey string `json:"assemblyai_key"`
-	}
+	var cfg config.Config
 	if err := json.Unmarshal(content, &cfg); err != nil {
 		fmt.Println("📋 Config file is present but could not be parsed")
 		return
 	}
 
 	fmt.Printf("🔑 AssemblyAI key: %s\n", maskKey(cfg.AssemblyAIKey))
+	if os.Getenv("ASSEMBLYAI_API_KEY") != "" {
+		fmt.Println("⚠️  ASSEMBLYAI_API_KEY is set in your environment and is used instead of this one.")
+	}
 }
 
 func maskKey(key string) string {

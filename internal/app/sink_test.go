@@ -50,8 +50,8 @@ func chunkOf(i int) []byte {
 // all reach the session exactly once, in order, in frames the API accepts.
 func TestSinkDeliversEverythingInOrderInBoundedFrames(t *testing.T) {
 	a := newAudioSink()
-	a.start()
-	defer a.stop()
+	r := a.start()
+	defer r.stop()
 
 	var want []byte
 	for i := 0; i < 50; i++ { // ~3s buffered while "dialling"
@@ -60,27 +60,27 @@ func TestSinkDeliversEverythingInOrderInBoundedFrames(t *testing.T) {
 	}
 
 	f := &fakeSender{}
-	a.attach(f)
+	r.attach(f)
 
 	for i := 50; i < 80; i++ { // live streaming
 		a.write(chunkOf(i))
 		want = append(want, chunkOf(i)...)
 	}
 
-	a.flush(2 * time.Second)
+	r.flush(2 * time.Second)
 
 	if got := f.received(); !bytes.Equal(got, want) {
 		t.Fatalf("delivered %d bytes, want %d, or out of order", len(got), len(want))
 	}
 	for _, fr := range f.frames {
-		if len(fr) == 0 || len(fr) > maxFrameBytes {
-			t.Errorf("frame of %d bytes, want 1..%d", len(fr), maxFrameBytes)
+		if len(fr) < minFrameBytes || len(fr) > maxFrameBytes {
+			t.Errorf("frame of %d bytes, want %d..%d", len(fr), minFrameBytes, maxFrameBytes)
 		}
 	}
-	if err := a.err(); err != nil {
+	if err := r.err(); err != nil {
 		t.Errorf("err() = %v", err)
 	}
-	if !bytes.Equal(a.audio(), want) {
+	if !bytes.Equal(r.audio(), want) {
 		t.Error("audio() does not hold the whole recording")
 	}
 }
@@ -91,11 +91,11 @@ func TestSinkDeliversEverythingInOrderInBoundedFrames(t *testing.T) {
 // Stop during the stall look like the CoreAudio deadlock.
 func TestSinkWriteNeverBlocksOnAStalledSend(t *testing.T) {
 	a := newAudioSink()
-	a.start()
-	defer a.stop()
+	r := a.start()
+	defer r.stop()
 
 	f := &fakeSender{block: make(chan struct{})}
-	a.attach(f)
+	r.attach(f)
 	a.write(chunkOf(0))
 	time.Sleep(20 * time.Millisecond) // the sender is now stuck inside Send
 
@@ -108,13 +108,13 @@ func TestSinkWriteNeverBlocksOnAStalledSend(t *testing.T) {
 	}
 
 	started = time.Now()
-	a.flush(200 * time.Millisecond)
+	r.flush(200 * time.Millisecond)
 	if d := time.Since(started); d < 150*time.Millisecond || d > time.Second {
 		t.Errorf("flush during a stall returned after %v, want about its 200ms timeout", d)
 	}
 
 	close(f.block)
-	a.flush(2 * time.Second)
+	r.flush(2 * time.Second)
 	if got, want := len(f.received()), 101*2048; got != want {
 		t.Errorf("delivered %d bytes after the stall cleared, want %d", got, want)
 	}
@@ -122,19 +122,19 @@ func TestSinkWriteNeverBlocksOnAStalledSend(t *testing.T) {
 
 func TestSinkStopsSendingAfterAFailure(t *testing.T) {
 	a := newAudioSink()
-	a.start()
-	defer a.stop()
+	r := a.start()
+	defer r.stop()
 
 	f := &fakeSender{fail: errors.New("socket closed")}
-	a.attach(f)
+	r.attach(f)
 	a.write(chunkOf(0))
 	a.write(chunkOf(1))
-	a.flush(time.Second)
+	r.flush(time.Second)
 
-	if a.err() == nil {
+	if r.err() == nil {
 		t.Fatal("err() = nil after the sender failed")
 	}
-	if got := len(a.audio()); got != 2*2048 {
+	if got := len(r.audio()); got != 2*2048 {
 		t.Errorf("audio() has %d bytes, want %d: the recording must survive a send failure", got, 2*2048)
 	}
 }
@@ -143,29 +143,29 @@ func TestSinkStopsSendingAfterAFailure(t *testing.T) {
 // not be able to touch the next recording.
 func TestSinkNewRecordingIsIsolatedFromAStalledSender(t *testing.T) {
 	a := newAudioSink()
-	a.start()
+	first := a.start()
 
 	stalled := &fakeSender{block: make(chan struct{})}
-	a.attach(stalled)
+	first.attach(stalled)
 	a.write(chunkOf(1))
 	time.Sleep(20 * time.Millisecond)
 
 	started := time.Now()
-	a.stop() // must return without waiting out the stall
+	first.stop() // must return without waiting out the stall
 	if d := time.Since(started); d > 1500*time.Millisecond {
 		t.Fatalf("stop took %v with a stalled sender", d)
 	}
 
-	a.start()
+	second := a.start()
 	next := &fakeSender{}
-	a.attach(next)
+	second.attach(next)
 	a.write(chunkOf(2))
-	a.flush(time.Second)
+	second.flush(time.Second)
 
 	close(stalled.block) // the old sender wakes up and finishes
 	time.Sleep(50 * time.Millisecond)
 
-	if !bytes.Equal(a.audio(), chunkOf(2)) {
+	if !bytes.Equal(second.audio(), chunkOf(2)) {
 		t.Error("the new recording's audio was disturbed")
 	}
 	if !bytes.Equal(next.received(), chunkOf(2)) {
@@ -174,5 +174,5 @@ func TestSinkNewRecordingIsIsolatedFromAStalledSender(t *testing.T) {
 	if !bytes.Equal(stalled.received(), chunkOf(1)) {
 		t.Errorf("the old session received %d bytes, want exactly its own chunk", len(stalled.received()))
 	}
-	a.stop()
+	second.stop()
 }

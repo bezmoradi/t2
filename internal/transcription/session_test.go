@@ -1,8 +1,10 @@
 package transcription
 
 import (
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -27,20 +29,8 @@ func turn(order int, text string, formatted bool) []byte {
 	if formatted {
 		f = "true"
 	}
-	return []byte(`{"type":"Turn","turn_order":` + itoa(order) +
+	return []byte(`{"type":"Turn","turn_order":` + strconv.Itoa(order) +
 		`,"transcript":"` + text + `","turn_is_formatted":` + f + `}`)
-}
-
-func itoa(i int) string {
-	if i == 0 {
-		return "0"
-	}
-	digits := ""
-	for i > 0 {
-		digits = string(rune('0'+i%10)) + digits
-		i /= 10
-	}
-	return digits
 }
 
 // A partial for a later turn must not wipe out an earlier turn's final. This
@@ -55,8 +45,8 @@ func TestPartialAfterFinalKeepsEarlierTurn(t *testing.T) {
 	if want := "First sentence. Second sentence"; got != want {
 		t.Errorf("transcript = %q, want %q", got, want)
 	}
-	if !fromFinal {
-		t.Error("fromFinal = false, want true: turn 0 was formatted")
+	if fromFinal {
+		t.Error("fromFinal = true, want false: the last turn is an unformatted partial")
 	}
 }
 
@@ -294,22 +284,7 @@ func TestSendAfterCloseIsClassifiable(t *testing.T) {
 
 	if err := s.Send(make([]byte, 64)); err == nil {
 		t.Fatal("Send on a dead session returned nil")
-	} else if !isSessionClosed(err) {
+	} else if !errors.Is(err, ErrSessionClosed) {
 		t.Errorf("Send error %v is not classifiable as ErrSessionClosed", err)
 	}
-}
-
-func isSessionClosed(err error) bool {
-	type unwrapper interface{ Unwrap() error }
-	for err != nil {
-		if err == ErrSessionClosed {
-			return true
-		}
-		u, ok := err.(unwrapper)
-		if !ok {
-			return false
-		}
-		err = u.Unwrap()
-	}
-	return false
 }

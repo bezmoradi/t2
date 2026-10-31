@@ -85,13 +85,14 @@ func TestSoak(t *testing.T) {
 
 		started := time.Now()
 		d.OnRelease(hotkeys.Release{Held: hold})
+		d.waitIdle(time.Minute)
 		releaseTotal += time.Since(started)
 
 		speak.Process.Kill()
 		speak.Wait()
 
 		if audio.Wedged() {
-			t.Logf("cycle %d: PortAudio stop deadlocked - this process's audio is wedged", i)
+			t.Logf("cycle %d: the audio stop hung - this process's audio is wedged", i)
 			probeNewStreamAfterWedge(t)
 			return
 		}

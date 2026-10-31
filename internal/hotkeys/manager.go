@@ -2,6 +2,9 @@ package hotkeys
 
 import "time"
 
+// Display is the hotkey as shown to the user.
+const Display = "Ctrl+Shift"
+
 // MaxHold is the longest a single hold may run. Past it the poller reports a
 // release while the keys are still down, then ignores them until they are
 // physically let go.
@@ -21,7 +24,9 @@ type Release struct {
 	Held time.Duration
 
 	// Cancelled means another key went down during the hold - a shortcut such
-	// as Ctrl+Shift+T, not dictation - so the recording should be discarded.
+	// as Ctrl+Shift+T, not dictation. It is reported the moment that key goes
+	// down, with Ctrl+Shift still held, so the recording stops at once instead
+	// of streaming until the keys come up.
 	Cancelled bool
 
 	// Capped means the hold reached MaxHold and the poller ended it while the
@@ -32,30 +37,4 @@ type Release struct {
 type EventHandler interface {
 	OnPress()
 	OnRelease(Release)
-}
-
-type Manager struct {
-	simple *SimpleHotkeyManager
-}
-
-func NewManager(handler EventHandler) *Manager {
-	return &Manager{
-		simple: NewSimpleManager(handler),
-	}
-}
-
-func (m *Manager) Start() error {
-	return m.simple.Start()
-}
-
-func (m *Manager) Stop() {
-	m.simple.Stop()
-}
-
-func (m *Manager) Listen() {
-	m.simple.Listen()
-}
-
-func (m *Manager) GetHotkeyDisplay() string {
-	return "Ctrl+Shift"
 }

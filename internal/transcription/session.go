@@ -20,6 +20,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gorilla/websocket"
 )
@@ -48,6 +49,17 @@ const (
 
 	dialTimeout  = 5 * time.Second
 	writeTimeout = 5 * time.Second
+
+	// readLimit caps a single server message. Turn messages carry the
+	// transcript and per-word timings of one turn, tens of kilobytes at most;
+	// without a cap a hostile or broken server could send one large enough to
+	// exhaust memory.
+	readLimit = 1 << 20
+
+	// maxTextBytes bounds one turn's transcript or one server error string.
+	// A single turn can span a whole five-minute hold, so this is far above
+	// any real dictation.
+	maxTextBytes = 64 << 10
 
 	// Turn detection.
 	//
@@ -136,13 +148,15 @@ var ErrSessionClosed = errors.New("transcription session closed")
 type Result struct {
 	Text string
 
-	// FromFinal is false when the text was assembled from partials only,
-	// meaning the server never formatted the last turn. The text is usable but
-	// unpunctuated, and the caller should not report plain success.
+	// FromFinal is false when the last turn was never formatted, so the end
+	// of the text is an unpunctuated draft that may still have been catching
+	// up. Earlier turns may be formatted; the caller should not report plain
+	// success either way.
 	FromFinal bool
 
-	// Complete is false when the session ended abnormally, so Text may be
-	// truncated. Never report success to the user when this is false.
+	// Complete is false when the session ended abnormally, or the server
+	// never confirmed the end of the session, so Text may be truncated. Never
+	// report success to the user when this is false.
 	Complete bool
 
 	// AudioSeconds and SessionSeconds come from the server's Termination
@@ -215,6 +229,7 @@ func Dial(apiKey string, sampleRate int) (*Session, error) {
 		}
 		return nil, fmt.Errorf("connecting to AssemblyAI: %w", err)
 	}
+	conn.SetReadLimit(readLimit)
 
 	s := &Session{
 		conn:     conn,
@@ -232,6 +247,18 @@ func Dial(apiKey string, sampleRate int) (*Session, error) {
 
 // Begun is closed once the server has confirmed the session.
 func (s *Session) Begun() <-chan struct{} { return s.begun }
+
+// Done is closed once the session has ended, for whatever reason. A session
+// the server rejects right after the upgrade - a bad key, no credit, too many
+// sessions - ends here without ever beginning; Err says why.
+func (s *Session) Done() <-chan struct{} { return s.done }
+
+// Err reports why the session ended, if it ended abnormally.
+func (s *Session) Err() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.readErr
+}
 
 // Send streams one chunk of PCM16 audio.
 func (s *Session) Send(pcm []byte) error {
@@ -267,6 +294,15 @@ func (s *Session) Finish(wait time.Duration) Result {
 		case <-s.term:
 		case <-s.done:
 		case <-time.After(wait):
+		}
+
+		// Termination is the server saying it has finalised every turn. Without
+		// it the last turn may be missing words, so the result is not complete
+		// - this used to be reported as a clean success.
+		select {
+		case <-s.term:
+		default:
+			termErr = fmt.Errorf("the server did not confirm the end of the session within %v", wait)
 		}
 	}
 
@@ -307,7 +343,7 @@ func (s *Session) Discard() {
 }
 
 // Close shuts the socket down. Safe to call more than once, and safe to call
-// without Finish - Cleanup uses it to guarantee no session outlives the process.
+// without Finish; Finish and Discard both end with it.
 func (s *Session) Close() {
 	s.closeOnce.Do(func() {
 		s.writeMu.Lock()
@@ -339,7 +375,9 @@ func (s *Session) sendTerminate() error {
 
 // transcript composes the recording from the best text available for each turn:
 // the formatted final where the server sent one, the latest partial otherwise,
-// joined in turn order.
+// joined in turn order. The bool reports whether the last turn is formatted:
+// an earlier formatted turn says nothing about whether the end of the
+// recording is.
 //
 // Partials and finals are kept apart on purpose. They used to share one field,
 // so a partial for a new turn - or a hallucinated "you" from trailing noise -
@@ -365,17 +403,17 @@ func (s *Session) transcript() (string, bool) {
 	sort.Ints(orders)
 
 	parts := make([]string, 0, len(orders))
-	anyFinal := false
+	lastFinal := false
 	for _, turn := range orders {
-		if text, ok := s.finals[turn]; ok {
-			parts = append(parts, text)
-			anyFinal = true
-			continue
+		text, ok := s.finals[turn]
+		if !ok {
+			text = s.partials[turn]
 		}
-		parts = append(parts, s.partials[turn])
+		parts = append(parts, text)
+		lastFinal = ok
 	}
 
-	return strings.Join(parts, " "), anyFinal
+	return strings.Join(parts, " "), lastFinal
 }
 
 func (s *Session) read() {
@@ -436,14 +474,17 @@ func (s *Session) handle(data []byte) {
 		s.beginOnce.Do(func() { close(s.begun) })
 
 	case "Turn":
-		if msg.Transcript == "" {
+		// Cleaned on arrival, because this text is both printed to the
+		// terminal and pasted into whatever application is focused.
+		text := Sanitize(msg.Transcript)
+		if text == "" {
 			return
 		}
 		s.mu.Lock()
 		if msg.Formatted {
-			s.finals[msg.TurnOrder] = msg.Transcript
+			s.finals[msg.TurnOrder] = text
 		} else {
-			s.partials[msg.TurnOrder] = msg.Transcript
+			s.partials[msg.TurnOrder] = text
 		}
 		s.mu.Unlock()
 
@@ -457,10 +498,41 @@ func (s *Session) handle(data []byte) {
 	case "Error":
 		s.mu.Lock()
 		if s.readErr == nil && msg.Error != "" {
-			s.readErr = fmt.Errorf("server error: %s", msg.Error)
+			s.readErr = fmt.Errorf("server error: %s", Sanitize(msg.Error))
 		}
 		s.mu.Unlock()
 	}
+}
+
+// Sanitize makes text that came from the server safe to print to a terminal
+// and to paste into an application.
+//
+// Transcripts, error messages and close reasons arrive as arbitrary strings.
+// Printed raw, an escape sequence in one could move the cursor and rewrite
+// what the terminal shows was pasted, or set the terminal's clipboard; pasted
+// raw, a newline acts as Enter. Tabs and line breaks become spaces, so words
+// either side stay apart. Other control characters, and the bidirectional
+// overrides and isolates that reorder how text is displayed, are dropped.
+// Letters, accents, joiners and the left-to-right and right-to-left marks
+// that real text uses are kept.
+func Sanitize(text string) string {
+	var b strings.Builder
+	b.Grow(min(len(text), maxTextBytes))
+	for _, r := range text {
+		switch {
+		case r == '\t' || r == '\n' || r == '\r':
+			r = ' '
+		case r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f):
+			continue
+		case (r >= 0x202a && r <= 0x202e) || (r >= 0x2066 && r <= 0x2069):
+			continue
+		}
+		if b.Len()+utf8.RuneLen(r) > maxTextBytes {
+			break
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
 }
 
 // isExpectedClose reports whether an error is the ordinary end of a session

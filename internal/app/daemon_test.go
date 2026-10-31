@@ -128,6 +128,7 @@ func TestWedgeThatClearsInTimeDoesNotRestart(t *testing.T) {
 	if !audio.Wedged() {
 		t.Fatal("the daemon did not detect the hanging stop")
 	}
+	d.waitIdle(time.Second) // the release is finished in the background
 
 	close(stream.release)
 	time.Sleep(restartGrace + 500*time.Millisecond)

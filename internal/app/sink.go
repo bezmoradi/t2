@@ -13,10 +13,20 @@ type audioSender interface {
 	Send(pcm []byte) error
 }
 
-// maxFrameBytes caps a single WebSocket audio frame at 800ms of 16kHz PCM16.
-// The API accepts frames between 50ms and 1000ms, so buffered audio has to be
-// flushed in pieces rather than as one large frame.
-const maxFrameBytes = audio.SampleRate * 2 * 800 / 1000
+// The API accepts audio frames between 50ms and 1000ms of 16kHz PCM16, and
+// closes the session (3007) on anything outside that.
+//
+// maxFrameBytes caps a frame at 800ms, so buffered audio is flushed in pieces
+// rather than as one large frame. minFrameBytes is 60ms, a margin above the
+// floor: live audio is held back until there is at least that much, and the
+// last piece of a recording is padded up to it with silence. Without the
+// floor, an 800ms frame taken from a backlog left whatever remained - as
+// little as 32ms - to go out on its own, and the T2_FRAMES_PER_BUFFER=32
+// diagnostic sent every frame at 2ms.
+const (
+	maxFrameBytes = audio.SampleRate * 2 * 800 / 1000
+	minFrameBytes = audio.SampleRate * 2 * 60 / 1000
+)
 
 // audioSink sits between the recorder and the network.
 //
@@ -39,28 +49,31 @@ const maxFrameBytes = audio.SampleRate * 2 * 800 / 1000
 // replaces the second buffer the old design kept re-slicing and re-allocating.
 type audioSink struct {
 	mu  sync.Mutex
-	rec *recording // the current recording; nil before the first
+	rec *recording // the recording the microphone is feeding; nil before the first
 }
 
-// recording is one key press's audio and its delivery state. The sender
-// goroutine holds it directly, so a sender still finishing a slow write when
-// the next recording starts cannot touch the next recording's state.
+// recording is one key press's audio and its delivery state. Everything after
+// the capture - attaching the session, flushing, stopping - goes through the
+// recording itself rather than the sink, because the next recording can start
+// while this one is still being finished.
 type recording struct {
 	mu      sync.Mutex
 	all     []byte // everything captured, append-only
 	sent    int    // bytes of all already delivered to the session
 	session audioSender
 	sendErr error
+	final   bool // capture is over: send the tail even if it is short
 	closed  bool
 
-	kick chan struct{} // wakes the sender: new audio, a session, or closing
+	kick chan struct{} // wakes the sender: new audio, a session, final, or closing
 	done chan struct{} // closed when the sender has exited
 }
 
 func newAudioSink() *audioSink { return &audioSink{} }
 
-// start begins a new recording and launches its sender.
-func (a *audioSink) start() {
+// start begins a new recording, makes it the one the microphone feeds, and
+// launches its sender.
+func (a *audioSink) start() *recording {
 	r := &recording{
 		kick: make(chan struct{}, 1),
 		done: make(chan struct{}),
@@ -71,6 +84,7 @@ func (a *audioSink) start() {
 	a.mu.Unlock()
 
 	go r.send()
+	return r
 }
 
 func (a *audioSink) current() *recording {
@@ -80,10 +94,10 @@ func (a *audioSink) current() *recording {
 }
 
 // write is the recorder's audio callback. It only appends.
-func (a *audioSink) write(pcm []byte) error {
+func (a *audioSink) write(pcm []byte) {
 	r := a.current()
 	if r == nil {
-		return nil
+		return
 	}
 
 	r.mu.Lock()
@@ -91,17 +105,11 @@ func (a *audioSink) write(pcm []byte) error {
 	r.mu.Unlock()
 
 	r.wake()
-	return nil
 }
 
 // attach hands the recording a live session; the sender flushes what was
 // buffered and streams from there.
-func (a *audioSink) attach(s audioSender) {
-	r := a.current()
-	if r == nil {
-		return
-	}
-
+func (r *recording) attach(s audioSender) {
 	r.mu.Lock()
 	r.session = s
 	r.mu.Unlock()
@@ -109,36 +117,39 @@ func (a *audioSink) attach(s audioSender) {
 	r.wake()
 }
 
-// flush waits until everything captured so far has been sent, the sender has
-// failed, or the timeout passes. Called once the recorder has stopped and
-// before the session is terminated, so the tail of the recording is not lost.
-func (a *audioSink) flush(timeout time.Duration) {
-	r := a.current()
-	if r == nil {
-		return
-	}
+// flush waits until everything captured has been sent, the sender has failed,
+// or the timeout passes, and reports whether everything was sent. Called once
+// the recorder has stopped and before the session is terminated, so the tail
+// of the recording is not lost - and when it is, the caller knows.
+func (r *recording) flush(timeout time.Duration) bool {
+	r.mu.Lock()
+	r.final = true
+	r.mu.Unlock()
+	r.wake()
 
 	deadline := time.Now().Add(timeout)
 	for {
 		r.mu.Lock()
-		drained := r.session == nil || r.sent == len(r.all) || r.sendErr != nil
+		sent := r.sent == len(r.all)
+		gaveUp := r.session == nil || r.sendErr != nil
 		r.mu.Unlock()
 
-		if drained || time.Now().After(deadline) {
-			return
+		if sent {
+			return true
+		}
+		if gaveUp || time.Now().After(deadline) {
+			return false
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 }
 
-// stop ends the sender. Safe to call more than once. It waits briefly for the
-// goroutine; one stuck in a write runs into the session's deadline on its own.
-func (a *audioSink) stop() {
-	r := a.current()
-	if r == nil {
-		return
-	}
-
+// stop ends the sender. Safe to call more than once. No frame is started
+// after stop returns - audio after Terminate is undefined on the server - so
+// whatever flush did not deliver is dropped here, and flush's result is how
+// the caller finds out. It waits briefly for a write already in progress; one
+// stuck runs into the session's deadline on its own.
+func (r *recording) stop() {
 	r.mu.Lock()
 	r.closed = true
 	r.mu.Unlock()
@@ -150,25 +161,15 @@ func (a *audioSink) stop() {
 	}
 }
 
-// err reports the first send failure of the current recording, if any.
-func (a *audioSink) err() error {
-	r := a.current()
-	if r == nil {
-		return nil
-	}
-
+// err reports the first send failure, if any.
+func (r *recording) err() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.sendErr
 }
 
-// audio returns a copy of everything captured in the current recording.
-func (a *audioSink) audio() []byte {
-	r := a.current()
-	if r == nil {
-		return nil
-	}
-
+// audio returns a copy of everything captured.
+func (r *recording) audio() []byte {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -184,23 +185,42 @@ func (r *recording) wake() {
 	}
 }
 
-// send streams all[sent:] to the session in frames of at most maxFrameBytes,
-// for as long as the recording lasts.
+// ready reports whether there is a frame to send. Called with mu held.
+func (r *recording) ready() bool {
+	if r.session == nil || r.sendErr != nil {
+		return false
+	}
+	backlog := len(r.all) - r.sent
+	return backlog >= minFrameBytes || (r.final && backlog > 0)
+}
+
+// frameSize is how much of a backlog goes into the next frame: at most
+// maxFrameBytes, but never so much that what remains is a sliver below
+// minFrameBytes.
+func frameSize(backlog int) int {
+	n := min(backlog, maxFrameBytes)
+	if rest := backlog - n; rest > 0 && rest < minFrameBytes {
+		n = backlog - minFrameBytes
+	}
+	return n
+}
+
+// send streams all[sent:] to the session for as long as the recording lasts.
 func (r *recording) send() {
 	defer close(r.done)
 
 	for {
 		r.mu.Lock()
-		for r.session == nil || r.sent == len(r.all) || r.sendErr != nil {
-			if r.closed {
-				r.mu.Unlock()
-				return
-			}
+		for !r.closed && !r.ready() {
 			r.mu.Unlock()
 			<-r.kick
 			r.mu.Lock()
 		}
-		n := min(len(r.all)-r.sent, maxFrameBytes)
+		if r.closed {
+			r.mu.Unlock()
+			return
+		}
+		n := frameSize(len(r.all) - r.sent)
 		frame := r.all[r.sent : r.sent+n]
 		session := r.session
 		r.mu.Unlock()
@@ -208,6 +228,13 @@ func (r *recording) send() {
 		// The frame is read without the lock. That is safe because all is
 		// append-only for the life of the recording: appends write past the
 		// end, and a reallocation copies the bytes rather than moving them.
+		// Only the final tail is ever short, and it is padded with silence
+		// in a copy rather than in place.
+		if n < minFrameBytes {
+			padded := make([]byte, minFrameBytes)
+			copy(padded, frame)
+			frame = padded
+		}
 		err := session.Send(frame)
 
 		r.mu.Lock()

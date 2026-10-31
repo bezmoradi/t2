@@ -1,4 +1,4 @@
-//go:build darwin
+//go:build darwin && cgo
 
 package hotkeys
 
@@ -51,7 +51,7 @@ func (h *spyHandler) last() Release {
 // recorder in the on state with no key held.
 func TestFastEdgeBurstNeverStrandsRecorder(t *testing.T) {
 	h := &spyHandler{slow: 120 * time.Millisecond}
-	s := NewSimpleManager(h)
+	s := NewManager(h)
 
 	go s.Listen()
 	defer s.Stop()
@@ -86,7 +86,7 @@ func TestFastEdgeBurstNeverStrandsRecorder(t *testing.T) {
 // and was discarded as an accidental tap.
 func TestHoldDurationComesFromEdgeTimestamps(t *testing.T) {
 	h := &spyHandler{slow: 200 * time.Millisecond}
-	s := NewSimpleManager(h)
+	s := NewManager(h)
 
 	go s.Listen()
 	defer s.Stop()
@@ -109,7 +109,7 @@ func TestHoldDurationComesFromEdgeTimestamps(t *testing.T) {
 // daemon can throw the recording away instead of transcribing a shortcut.
 func TestCancelledHoldIsReported(t *testing.T) {
 	h := &spyHandler{}
-	s := NewSimpleManager(h)
+	s := NewManager(h)
 
 	go s.Listen()
 	defer s.Stop()
@@ -132,7 +132,7 @@ func TestCancelledHoldIsReported(t *testing.T) {
 // can tell the user why the recording ended with the keys still down.
 func TestCappedReleaseIsReported(t *testing.T) {
 	h := &spyHandler{}
-	s := NewSimpleManager(h)
+	s := NewManager(h)
 
 	go s.Listen()
 	defer s.Stop()
@@ -158,7 +158,7 @@ func TestCappedReleaseIsReported(t *testing.T) {
 func TestHoldIsCappedAndKeysIgnoredUntilReleased(t *testing.T) {
 	var down atomic.Bool
 	h := &spyHandler{}
-	s := NewSimpleManager(h)
+	s := NewManager(h)
 	s.hotkeyDown = down.Load
 	s.otherDown = func() bool { return false }
 	s.maxHold = 300 * time.Millisecond
@@ -207,7 +207,7 @@ func TestHoldIsCappedAndKeysIgnoredUntilReleased(t *testing.T) {
 // A release with no press in flight must not close out the next press.
 func TestStrayReleaseIsNotPairedWithNextPress(t *testing.T) {
 	h := &spyHandler{}
-	s := NewSimpleManager(h)
+	s := NewManager(h)
 
 	go s.Listen()
 	defer s.Stop()
@@ -231,7 +231,7 @@ func TestStrayReleaseIsNotPairedWithNextPress(t *testing.T) {
 }
 
 func TestStopUnblocksListen(t *testing.T) {
-	s := NewSimpleManager(&spyHandler{})
+	s := NewManager(&spyHandler{})
 	done := make(chan struct{})
 	go func() { s.Listen(); close(done) }()
 

@@ -3,13 +3,15 @@ package config
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/user"
 	"path/filepath"
 	"strings"
 
-	"github.com/joho/godotenv"
+	"golang.org/x/term"
 )
 
 const (
@@ -22,23 +24,41 @@ type Config struct {
 	AssemblyAIKey string `json:"assemblyai_key"`
 }
 
-// GetConfigDir returns the user's config directory for T2.
-func GetConfigDir() (string, error) { return getConfigDir() }
+// stdin is shared by every prompt, so a line buffered while reading one
+// answer is still there for the next.
+var stdin = bufio.NewReader(os.Stdin)
 
-// getConfigDir returns the user's config directory for T2
-func getConfigDir() (string, error) {
+// GetConfigDir returns t2's config directory, ~/.config/t2.
+func GetConfigDir() (string, error) {
 	usr, err := user.Current()
 	if err != nil {
 		return "", err
 	}
-
-	configDir := filepath.Join(usr.HomeDir, ".config", configDirName)
-	return configDir, nil
+	return filepath.Join(usr.HomeDir, ".config", configDirName), nil
 }
 
-// getConfigPath returns the full path to the config file
-func getConfigPath() (string, error) {
-	configDir, err := getConfigDir()
+// EnsureConfigDir creates the config directory if needed and makes it
+// private to the user. It holds the API key and recordings of the user's
+// voice, so other accounts on the Mac must not be able to list or read it.
+func EnsureConfigDir() (string, error) {
+	dir, err := GetConfigDir()
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
+	// MkdirAll leaves an existing directory's mode alone, and older versions
+	// created this one 0755.
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return "", err
+	}
+	return dir, nil
+}
+
+// GetConfigPath returns the full path to the config file.
+func GetConfigPath() (string, error) {
+	configDir, err := GetConfigDir()
 	if err != nil {
 		return "", err
 	}
@@ -47,7 +67,7 @@ func getConfigPath() (string, error) {
 
 // LoadConfig loads configuration from file
 func LoadConfig() (*Config, error) {
-	configPath, err := getConfigPath()
+	configPath, err := GetConfigPath()
 	if err != nil {
 		return nil, err
 	}
@@ -69,19 +89,13 @@ func LoadConfig() (*Config, error) {
 	return &config, nil
 }
 
-// SaveConfig saves configuration to file
+// SaveConfig saves configuration to file, readable by the user only.
 func SaveConfig(config *Config) error {
-	configDir, err := getConfigDir()
-	if err != nil {
+	if _, err := EnsureConfigDir(); err != nil {
 		return err
 	}
 
-	// Create config directory if it doesn't exist
-	if err := os.MkdirAll(configDir, 0755); err != nil {
-		return err
-	}
-
-	configPath, err := getConfigPath()
+	configPath, err := GetConfigPath()
 	if err != nil {
 		return err
 	}
@@ -91,17 +105,12 @@ func SaveConfig(config *Config) error {
 		return err
 	}
 
-	// Write with user-only permissions for security
-	if err := os.WriteFile(configPath, data, 0600); err != nil {
+	if err := os.WriteFile(configPath, data, 0o600); err != nil {
 		return err
 	}
-
-	return nil
-}
-
-// GetConfigPath returns the full path to the config file (exported for CLI commands)
-func GetConfigPath() (string, error) {
-	return getConfigPath()
+	// WriteFile only applies the mode when it creates the file; a key file
+	// that already existed with a looser mode would keep it.
+	return os.Chmod(configPath, 0o600)
 }
 
 // promptForAPIKey prompts user to enter their AssemblyAI API key
@@ -112,19 +121,41 @@ func promptForAPIKey() (string, error) {
 	fmt.Println("   2. Sign up and get your API key from the dashboard")
 	fmt.Println("   3. You get 5 hours of free transcription monthly")
 	fmt.Println()
-	fmt.Print("🔐 Please enter your AssemblyAI API key: ")
+	fmt.Print("🔐 Please enter your AssemblyAI API key (input is hidden): ")
 
-	scanner := bufio.NewScanner(os.Stdin)
-	if !scanner.Scan() {
-		return "", fmt.Errorf("failed to read input")
+	apiKey, err := readSecret()
+	if err != nil {
+		return "", fmt.Errorf("failed to read input: %w", err)
 	}
 
-	apiKey := strings.TrimSpace(scanner.Text())
+	apiKey = strings.TrimSpace(apiKey)
 	if apiKey == "" {
 		return "", fmt.Errorf("API key cannot be empty")
 	}
 
 	return apiKey, nil
+}
+
+// readSecret reads a line without echoing it when stdin is a terminal, so
+// the key does not end up on screen or in terminal scrollback.
+func readSecret() (string, error) {
+	fd := int(os.Stdin.Fd())
+	if term.IsTerminal(fd) {
+		b, err := term.ReadPassword(fd)
+		fmt.Println()
+		return string(b), err
+	}
+	return readLine()
+}
+
+// readLine reads one line from stdin. Input that ends without a newline still
+// counts; nothing at all is io.EOF.
+func readLine() (string, error) {
+	line, err := stdin.ReadString('\n')
+	if err != nil && !(errors.Is(err, io.EOF) && line != "") {
+		return "", err
+	}
+	return strings.TrimRight(line, "\r\n"), nil
 }
 
 // validateAPIKey performs a basic validation of the API key format
@@ -133,59 +164,45 @@ func validateAPIKey(apiKey string) bool {
 	return len(apiKey) >= 30 && len(apiKey) <= 50
 }
 
-// GetAPIKey retrieves API key using fallback priority system
+// GetAPIKey returns the AssemblyAI API key from, in order: the
+// ASSEMBLYAI_API_KEY environment variable, ~/.config/t2/config.json, or an
+// interactive prompt whose answer is saved to that file.
+//
+// No .env file is read. One used to be read from the current working
+// directory, which meant running t2 inside another project silently billed
+// that project's AssemblyAI account; after that it was read from the config
+// directory, where nothing documented it and --reset-key did not remove it.
 func GetAPIKey() (string, error) {
-	// Priority 1: Environment variable (for power users)
 	if apiKey := os.Getenv("ASSEMBLYAI_API_KEY"); apiKey != "" {
 		return apiKey, nil
 	}
 
-	// A .env file used to be read from the *current working directory*, which
-	// meant running t2 inside another project silently billed that project's
-	// AssemblyAI account - and exported every other variable in that file into
-	// this process. Only this tool's own config directory is consulted now.
-	if dir, err := getConfigDir(); err == nil {
-		if err := godotenv.Load(filepath.Join(dir, ".env")); err == nil {
-			if apiKey := os.Getenv("ASSEMBLYAI_API_KEY"); apiKey != "" {
-				return apiKey, nil
-			}
-		}
-	}
-
-	// Priority 3: User config file
 	config, err := LoadConfig()
 	if err == nil && config.AssemblyAIKey != "" {
 		return config.AssemblyAIKey, nil
 	}
 
-	// Priority 4: Interactive prompt
 	apiKey, err := promptForAPIKey()
 	if err != nil {
 		return "", err
 	}
 
-	// Validate API key format
 	if !validateAPIKey(apiKey) {
 		fmt.Println("⚠️  Warning: API key format seems unusual (expected 30-50 characters)")
 		fmt.Print("🤔 Continue anyway? (y/n): ")
-		scanner := bufio.NewScanner(os.Stdin)
-		if scanner.Scan() {
-			response := strings.ToLower(strings.TrimSpace(scanner.Text()))
-			if response != "y" && response != "yes" {
-				return "", fmt.Errorf("API key validation cancelled")
-			}
+		// No answer - end of input - is a no, not a yes.
+		response, err := readLine()
+		response = strings.ToLower(strings.TrimSpace(response))
+		if err != nil || (response != "y" && response != "yes") {
+			return "", fmt.Errorf("API key validation cancelled")
 		}
 	}
 
-	// Save the API key for future use
-	newConfig := &Config{
-		AssemblyAIKey: apiKey,
-	}
-	if err := SaveConfig(newConfig); err != nil {
+	if err := SaveConfig(&Config{AssemblyAIKey: apiKey}); err != nil {
 		fmt.Printf("⚠️  Warning: Failed to save API key: %v\n", err)
 		fmt.Println("💡 You'll need to enter it again next time")
 	} else {
-		configPath, _ := getConfigPath()
+		configPath, _ := GetConfigPath()
 		fmt.Printf("✅ API key saved securely to %s\n", configPath)
 	}
 

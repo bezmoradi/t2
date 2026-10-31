@@ -110,7 +110,7 @@ func TestCaptureReportsChunksLevelsAndBytes(t *testing.T) {
 	useFake(t, f)
 
 	var sent atomic.Int64
-	r := NewRecorder(func(b []byte) error { sent.Add(int64(len(b))); return nil })
+	r := NewRecorder(func(b []byte) { sent.Add(int64(len(b))) })
 	if err := r.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -233,24 +233,5 @@ func TestStarvationIsArmedByTheFirstChunk(t *testing.T) {
 	}
 	if out.Chunks != 1 {
 		t.Errorf("chunks = %d, want 1", out.Chunks)
-	}
-}
-
-func TestSendErrorEndsTheCapture(t *testing.T) {
-	f := &fakeStream{chunk: tone(10), avail: Frames, refill: true}
-	useFake(t, f)
-
-	boom := errors.New("socket closed")
-	r := NewRecorder(func([]byte) error { return boom })
-	if err := r.Start(); err != nil {
-		t.Fatal(err)
-	}
-	time.Sleep(30 * time.Millisecond)
-
-	if out := r.Stop(); !errors.Is(out.Err, boom) {
-		t.Fatalf("err = %v, want the send error", out.Err)
-	}
-	if f.closes() != 1 {
-		t.Errorf("stream closed %d times, want 1", f.closes())
 	}
 }

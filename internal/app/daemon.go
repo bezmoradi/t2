@@ -150,7 +150,23 @@ func (d *Daemon) Initialize() error {
 }
 
 func (d *Daemon) Run() error {
+	// What would stop recording or pasting is found before the hotkey
+	// starts, and reported even if the hotkey then fails. A machine missing
+	// several things used to learn about one of them per run.
+	var warnings []string
+	for _, why := range []string{audio.Limitation(), clipboard.Limitation()} {
+		if why != "" {
+			warnings = append(warnings, why)
+		}
+	}
+	warn := func() {
+		for _, why := range warnings {
+			fmt.Printf("⚠️  %s\n", why)
+		}
+	}
+
 	if err := d.hotkeys.Start(); err != nil {
+		warn()
 		return fmt.Errorf("failed to start hotkey: %v", err)
 	}
 
@@ -162,9 +178,7 @@ func (d *Daemon) Run() error {
 	if src := d.hotkeys.Source(); src != "" {
 		fmt.Printf("⌨️  Reading the keys through %s\n", src)
 	}
-	if why := clipboard.Limitation(); why != "" {
-		fmt.Printf("⚠️  %s\n", why)
-	}
+	warn()
 	fmt.Println("🛑 Press Ctrl+C to exit")
 	fmt.Println()
 

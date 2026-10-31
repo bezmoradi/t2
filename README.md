@@ -43,7 +43,7 @@ For example, on Ubuntu with X11:
 $ sudo apt install golang pulseaudio-utils xclip xdotool
 ```
 
-t2 prints a warning at startup if a clipboard or paste tool is missing.
+t2 prints a warning at startup if a clipboard or paste tool is missing, or if the sound server has no microphone.
 
 **On Wayland, t2 needs to be in the `input` group to see Ctrl + Shift.** A Wayland desktop doesn't let one program see keys typed into another, so t2 reads the key state from the kernel's input devices (`/dev/input`) instead:
 
@@ -51,7 +51,7 @@ t2 prints a warning at startup if a clipboard or paste tool is missing.
 $ sudo usermod -aG input $USER
 ```
 
-Then log out and back in. Be aware that this lets every program you run read, and also send, every keystroke, not only t2. t2 itself only checks which keys are down, about ten times a second, and never records keystrokes. On X11 none of this is needed: t2 asks the X server, which any program can do.
+Then log out and back in. Be aware that this lets every program you run read, and also send, every keystroke, not only t2. t2 itself only checks which keys are down, about ten times a second, and never records keystrokes. On X11 none of this is needed: t2 asks the X server, which any program can do. If no keyboard is connected when t2 starts, it waits and uses one as soon as it's plugged in. It only sees keyboards attached to the machine: keys typed over SSH, or through screen sharing, usually don't reach `/dev/input`.
 
 ### Add Go to Your PATH
 
@@ -188,5 +188,5 @@ No `.env` file is read.
 ## Supported Platforms
 
 -   ✅ **macOS** (fully supported)
--   ✅ **Linux** on X11, and on Wayland with the `input` group (see [Prerequisites](#linux)). So far it has been tested in Docker containers only: X11 on Xvfb, `/dev/input` with a virtual keyboard, and PulseAudio with a virtual microphone. It hasn't yet run on a physical Linux desktop.
+-   ✅ **Linux**
 -   ❌ **Windows** (planned)

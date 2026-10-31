@@ -21,9 +21,6 @@ func main() {
 	)
 	flag.Parse()
 
-	// Flags are handled before the version check. The check used to run first,
-	// so `t2 --version` could perform a network request and then exit without
-	// ever printing the version.
 	if *showVersion {
 		handleShowVersion()
 		return
@@ -34,21 +31,16 @@ func main() {
 		return
 	}
 
-	// Before anything else that touches the config: a second daemon would
-	// paste every dictation twice, and --reset-key from it would delete the
-	// running one's key.
-	lock, err := app.LockInstance()
+	instanceLock, err := app.LockInstance()
 	if err != nil {
 		log.Fatalf("%v", err)
 	}
-	defer lock.Close()
+	defer instanceLock.Close()
 
 	if *resetKey {
 		handleResetKey()
 	}
 
-	// Notify, never block. This previously refused to start the app whenever
-	// the local version differed from main in either direction.
 	go notifyIfOutdated()
 
 	daemon := app.NewDaemon(*verbose)
@@ -67,7 +59,7 @@ func notifyIfOutdated() {
 		return
 	}
 
-	fmt.Printf("\n💡 T2 %s is available (you have %s). %s\n", newVersion, version.VERSION, version.UPDATE_MESSAGE)
+	fmt.Printf("\n💡 T2 %s is available (you have %s). %s\n", newVersion, version.VERSION, version.UpdateMessage)
 	fmt.Printf("   go install github.com/bezmoradi/t2/cmd/t2@%s\n\n", newVersion)
 }
 
@@ -92,8 +84,6 @@ func handleShowConfig() {
 		return
 	}
 
-	// The key is masked rather than printed. This is the natural command to run
-	// when asking someone for help, and it used to dump the API key verbatim.
 	var cfg config.Config
 	if err := json.Unmarshal(content, &cfg); err != nil {
 		fmt.Println("📋 Config file is present but could not be parsed")
@@ -124,8 +114,6 @@ func handleResetKey() {
 
 	fmt.Println("🔄 Saved API key removed.")
 
-	// The old message promised a prompt unconditionally, which is wrong when
-	// the key is coming from the environment instead of the config file.
 	if os.Getenv("ASSEMBLYAI_API_KEY") != "" {
 		fmt.Println("⚠️  ASSEMBLYAI_API_KEY is still set in your environment and will be used instead.")
 	} else {

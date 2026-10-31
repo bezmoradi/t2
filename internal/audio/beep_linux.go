@@ -2,17 +2,23 @@ package audio
 
 import (
 	"bytes"
+	"encoding/binary"
+	"fmt"
 	"math"
 	"os/exec"
 	"sync"
-	"syscall"
+	"time"
 )
 
-// PlayBeep plays a short feedback tone. It does not block.
-//
-// Linux has no sound file every desktop ships, so the tones are generated
-// and played through pacat, which comes in the same package as parecord:
-// a higher one for start, a lower one for stop.
+const (
+	toneSampleRate = 16000
+	startToneHz    = 880
+	stopToneHz     = 587
+	toneLength     = 80 * time.Millisecond
+	toneFade       = 5 * time.Millisecond
+	toneVolume     = 0.25
+)
+
 func PlayBeep(beepType string) {
 	pcm := startTone()
 	if beepType == "stop" {
@@ -20,39 +26,33 @@ func PlayBeep(beepType string) {
 	}
 
 	cmd := exec.Command("pacat", "--playback", "--raw", "--format=s16le",
-		"--rate=16000", "--channels=1", "--client-name=t2", "--stream-name=Beep")
+		fmt.Sprintf("--rate=%d", toneSampleRate), "--channels=1", "--client-name=t2", "--stream-name=Beep")
 	cmd.Stdin = bytes.NewReader(pcm)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
+	cmd.SysProcAttr = killedWithT2()
 	if err := cmd.Start(); err != nil {
 		return
 	}
-
-	// Reap the child without waiting on it here.
 	go cmd.Wait()
 }
 
 var (
-	startTone = sync.OnceValue(func() []byte { return beepTone(880, 0.08) })
-	stopTone  = sync.OnceValue(func() []byte { return beepTone(587, 0.08) })
+	startTone = sync.OnceValue(func() []byte { return fadedSineS16LE(startToneHz, toneLength) })
+	stopTone  = sync.OnceValue(func() []byte { return fadedSineS16LE(stopToneHz, toneLength) })
 )
 
-// beepTone is a sine at freq Hz lasting secs, as 16 kHz mono s16le, faded in and
-// out over 5ms so it does not click.
-func beepTone(freq, secs float64) []byte {
-	const rate = 16000
-	n := int(secs * rate)
-	fade := rate * 5 / 1000
-	out := make([]byte, 2*n)
+func fadedSineS16LE(hz float64, length time.Duration) []byte {
+	n := int(length.Seconds() * toneSampleRate)
+	fadeSamples := int(toneFade.Seconds() * toneSampleRate)
+	out := make([]byte, BytesPerSample*n)
 	for i := range n {
-		gain := 0.25
-		if i < fade {
-			gain *= float64(i) / float64(fade)
-		} else if n-i < fade {
-			gain *= float64(n-i) / float64(fade)
+		gain := toneVolume
+		if i < fadeSamples {
+			gain *= float64(i) / float64(fadeSamples)
+		} else if n-i < fadeSamples {
+			gain *= float64(n-i) / float64(fadeSamples)
 		}
-		v := int16(gain * 32767 * math.Sin(2*math.Pi*freq*float64(i)/rate))
-		out[2*i] = byte(v)
-		out[2*i+1] = byte(v >> 8)
+		v := int16(gain * math.MaxInt16 * math.Sin(2*math.Pi*hz*float64(i)/toneSampleRate))
+		binary.LittleEndian.PutUint16(out[BytesPerSample*i:], uint16(v))
 	}
 	return out
 }

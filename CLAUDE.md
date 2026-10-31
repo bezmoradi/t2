@@ -16,7 +16,7 @@ go vet ./... && GOOS=linux CGO_ENABLED=0 go vet ./... && GOOS=windows go vet ./.
 GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build ./... && GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build ./...
 ```
 
-Running the real binary creates `~/.config/t2` (mode 0700) and its lock file, and exits if another t2 holds the lock. For experiments, use `HOME=$(mktemp -d) ASSEMBLYAI_API_KEY=dummy ./t2`.
+Running the real binary creates `~/.config/t2` (mode 0700) and its lock file, and exits if another t2 holds the lock. The folder comes from the user database (`os/user`), not `$HOME`, so a temporary `HOME` doesn't isolate a run: it still takes the real lock, and a failed dictation replaces the user's saved recording. Run experiments in a container, or as another user, with `ASSEMBLYAI_API_KEY=dummy`.
 
 ## Testing
 
@@ -28,13 +28,15 @@ Linux can be run end to end in Docker (`golang:1.27-bookworm`):
 - **X11 keys:** Xvfb plus `xdotool keydown`/`keyup`. t2 polls every 100 ms, and `xdotool key` taps for about 12 ms, so it's usually missed. Hold other keys for 150 ms, as a person does.
 - **The /dev/input path:** a uinput virtual keyboard in a `--privileged` container with `-v /dev/input:/dev/input`, and `WAYLAND_DISPLAY` set so t2 takes that path. The Debian image has no `input` group; create it.
 - **The API key:** use a dummy key. The dial then fails authentication and nothing is billed.
+- **Paste:** check the text in a real app, not the tool's exit status, and include a GTK3 app (a `python3-gi` `Gtk.Entry` that prints its text works): GTK3 ignores shortcuts from wtype while GTK4 takes them. A headless Sway runs in Docker (`WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1 WLR_RENDERER=pixman sway`, as a non-root user). The container has no `LANG`, which is what exposed wtype's locale bug.
 
 ## Constraints
 
+- **No comments in the code, ever.** That covers Go, C and the workflow files: no doc comments, no inline comments, no commented-out code. A comment drifts from the code it describes, so the code is the only source of truth. Make names, named constants, types and small functions say what a comment would have said. The only exceptions are directives the toolchain reads: `//go:build`, `//export`, and the `#cgo` and `#include` lines of a cgo preamble. C code goes in `.c` and `.h` files (`aq_darwin.c`, `keys_darwin.c`), never in the preamble. A constraint the code can't express goes in this file, not in a comment.
 - **AssemblyAI bills the wall-clock time a session is open, idle included.** Never open a session outside a recording. The dial waits until a hold reaches 400 ms (`quickPressThreshold`), so taps and quick shortcuts never connect. Capture starts on the press and is buffered meanwhile. Every skip path closes a session that was opened. `speechModel` is pinned because the server default costs three times as much.
-- **The API key** comes from `ASSEMBLYAI_API_KEY`, then `~/.config/t2/config.json` (0600, in a 0700 directory), then a hidden prompt that saves it. No `.env` file is read. Never print or log the key.
+- **The API key** comes from `ASSEMBLYAI_API_KEY`, then `~/.config/t2/config.json` (0600, in a 0700 directory), then a hidden prompt that saves it. No `.env` file is read: one read from the working directory once billed another project's account. Never print or log the key; `--show-config` masks it, because people paste that output when asking for help.
 - **Text from the server** (transcripts, error messages, close reasons) goes through `transcription.Sanitize` (or the daemon's `errText`) before it's printed or pasted, because it can contain terminal control characters. Server messages are capped at 1 MiB, and the update check's response body at 64 KiB.
-- **The paste keystroke is sent once and never retried.** osascript and the Linux tools can report a failure after the keystroke was delivered, and a second paste corrupts what the user is typing. The text stays on the clipboard either way.
+- **The paste keystroke, or the typing on Wayland, is sent once and never retried.** osascript and the Linux tools can report a failure after the keys were delivered, and a second paste corrupts what the user is typing. The text stays on the clipboard either way.
 - **No cgo on Linux.** `go install` there must work with no C compiler and no `-dev` packages. That's why the X11 poller uses `github.com/jezek/xgb` instead of Xlib, and why capture and beeps run `parecord` and `pacat`.
 - **GitHub text:** `.github/workflows/claude.yml` reacts to mentions of the bot. Put handles in backticks in issues, PRs and comments.
 - **Toolchain:** go.mod requires go 1.27.3, for the patched crypto/tls and crypto/x509. It pins `godebug x509sslcertoverrideplatform=0` so certificate checks stay on Apple's verifier.
@@ -46,45 +48,52 @@ Files are split by build constraint. `*_darwin.go` (cgo where needed) and `*_lin
 | Package | macOS | Linux |
 |---|---|---|
 | `internal/audio` | AudioQueue (`aq_darwin.c`), afplay beeps | One `parecord --raw` process per recording (PulseAudio, or PipeWire through pipewire-pulse); generated tones through `pacat` |
-| `internal/hotkeys` | CoreGraphics key state (`keys_darwin.go`) | The X server's key map through xgb when `DISPLAY` is set and `WAYLAND_DISPLAY` isn't (`x11_linux.go`); otherwise EVIOCGKEY on every `/dev/input` keyboard (`evdev_linux.go`) |
-| `internal/clipboard` | pbcopy + osascript Cmd+V | xclip/xsel + xdotool on X11; wl-copy + wtype on Wayland |
+| `internal/hotkeys` | CoreGraphics key state (`keys_darwin.c`) | The X server's key map through xgb when `DISPLAY` is set and `WAYLAND_DISPLAY` isn't (`x11_linux.go`); otherwise EVIOCGKEY on every `/dev/input` keyboard (`evdev_linux.go`) |
+| `internal/clipboard` | pbcopy + osascript Cmd+V | xclip/xsel + xdotool Ctrl+V on X11; on Wayland, wl-copy, then wtype types the text |
 
 ## Architecture
 
 **Daemon (`internal/app/daemon.go`).**
 - A press starts capture and the start beep.
-- A release only stops capture. Everything after it runs on a per-hold `take` in an ordered background queue: the dial result, flushing the audio, `Finish`, and the paste. So the next hold can record at once, and results paste in the order they were spoken, each once the hotkey is up (`waitKeysUp`).
-- Skip paths, checked first: a cancelled hold (another key pressed), a quick press under 400 ms, no audio at all, and silence below RMS 150. None of them transcribes. A hold cancelled after 3 s or more is saved.
-- Failures save `~/.config/t2/last-recording.wav` (0600). There is one slot, and the next clean success deletes it.
+- A release only stops capture. Everything after it runs, for each `hold`, in an ordered background queue: the dial result, flushing the audio, `Finish`, and the paste. So the next hold can record at once, and results paste in the order they were spoken, each once the hotkey is up (`waitKeysUp`).
+- Skip paths, checked first: a cancelled hold (another key pressed), a quick press under 400 ms, no audio at all, and silence below RMS 150. None of them transcribes. A hold cancelled after 3 s or more is saved; taps, quick presses and silent holds never are, because there's one slot and they would overwrite a failure's recording.
+- Failures save `~/.config/t2/last-recording.wav` (0600). There is one slot, and the next clean success deletes it. `WriteWAV` writes through `os.CreateTemp` and a rename: writing the path directly gives 0644 under the usual umask, and an existing file keeps its mode, which would expose a recording of the user's voice.
 - One instance runs at a time, enforced by an flock on `~/.config/t2/t2.lock`.
+- `activeHold` has no lock: only `OnPress` and `OnRelease`, on the hotkey goroutine, touch it, and `Cleanup` after `Listen` has returned. A queued step whose hold never dialled must not wait for a dial result, or every later recording hangs behind it.
 
-**Sink (`internal/app/sink.go`).** The capture goroutine only appends audio. A per-recording sender goroutine streams it to the session. That way a stalled WebSocket write can neither overflow capture nor look like a stuck stop. Frames are 60–800 ms, with the last one padded: the API closes the session (3007) on frames outside 50–1000 ms.
+**Sink (`internal/app/sink.go`).** The capture goroutine only appends audio. A per-recording sender goroutine streams it to the session. That way a stalled WebSocket write can neither overflow capture nor look like a stuck stop. Frames are 60–800 ms, with the last one padded: the API closes the session (3007) on frames outside 50–1000 ms. `recording.captured` is append-only: the sender reads frames from it outside the lock and pads the last one in a copy.
 
 **Audio (`internal/audio`).**
 - `Stream` is the backend interface; `OpenStream` opens the platform's backend for each recording, on the current default microphone.
-- The capture loop never blocks inside the audio layer: it polls `Available` and reads only whole chunks.
-- `Recorder.Stop` bounds its waits. If a stream won't close, `Outcome.Wedged` is set, and the daemon finishes the recording, waits 10 s, then re-execs itself (`restartProcess`). That's limited to 3 times an hour, counted in `T2_RESTART_TIMES`, and `--reset-key` is dropped from the new argv.
+- The capture loop never blocks inside the audio layer: it polls `Available` and reads only whole chunks. On macOS the AudioQueue callback (`aq_darwin.c`) only copies into the mutex-guarded ring that Go polls; it must never call into Go or block, or the CoreAudio thread can deadlock.
+- `Recorder.Stop` bounds its waits. If a stream won't close, `Outcome.Wedged` is set, and the daemon finishes the recording, waits 10 s, then re-execs itself (`restartProcess`). That's limited to 3 times an hour, counted in `T2_RESTART_TIMES`, and `--reset-key` is dropped from the new argv. If that variable can't be set, the restart is skipped, since the limit could never be reached. A press while wedged plays no beep, because the player would be left a zombie at exec. The restart waits for released recordings first, because exec kills them.
 - This watchdog exists because PortAudio's CoreAudio backend deadlocked in `Pa_StopStream` and left t2 deaf until restarted. AudioQueue replaced PortAudio for that reason. On Linux, Close kills `parecord`, so it can't hang, and `Pdeathsig` stops the microphone staying open if t2 dies.
 
 **Hotkeys (`internal/hotkeys`).**
 - One poller (`simple.go`, every 100 ms) runs over two per-platform probes, `ctrlShiftDown` and `otherKeyDown`, so a hold behaves the same everywhere:
   - Ctrl+Shift alone starts it;
-  - Alt or Super (Cmd or Option on macOS) with it rejects it;
+  - Alt or Super (Cmd or Option on macOS) with it rejects it. They aren't merely ignored, because Cmd+Ctrl+Shift+4 is screenshot-to-clipboard, and a recording would race it for the pasteboard;
   - any other key cancels it at once;
   - a hold is capped at `MaxHold` (5 minutes).
 - After a cancel or the cap, the keys are ignored until they physically come up, so a stuck modifier can't keep the microphone open.
+- Press and release edges are never dropped (`emitBlocking` has no `default:` case): a lost release leaves the microphone recording with nothing to stop it.
 - The `/dev/input` path starts even with no keyboard, unless a device was refused for lack of permission (then it stops with the `input` group message). The 3 s rescan picks up a keyboard plugged in later. Refused devices are retried on every rescan, because a node is briefly root's before udev hands it to the `input` group.
 - On Wayland, no program can see keys typed into another program's window, X11 programs under XWayland included. That's why Wayland uses `/dev/input`, which needs the `input` group. The GlobalShortcuts portal was rejected for two reasons: a trigger can't be modifier-only, and it can't report the cancel.
 
 **Clipboard (`internal/clipboard`).**
-- GNOME and KDE on Wayland accept no synthetic keystrokes. There, `PasteTextSafely` returns `ErrCopiedOnly`, which the daemon reports as "Copied", not as a failure.
+- On Wayland, t2 types the text (`wtype -`, reading stdin) instead of sending Ctrl+V. GTK3 apps, Mousepad among them, ignore every shortcut wtype sends: wtype presses keys from a keymap it generates, which GTK3's shortcut matching misses, while typed characters arrive intact. Seen on labwc and Sway. The text is still copied first, as the fallback, and a failed copy doesn't stop the typing.
+- wtype runs with `LC_ALL=C.UTF-8`. In a locale that isn't UTF-8 it stops at the first non-ASCII character and still exits 0.
+- GNOME and KDE on Wayland accept no synthetic keystrokes. There, `PasteOnce` returns `ErrCopiedOnly`, which the daemon reports as "Copied", not as a failure.
 - Don't capture the output of the Linux clipboard tools. They fork a child that keeps serving the text and inherits any output pipe, so collecting stdout or stderr waits until the next copy.
-- Every tool runs with a 3 s timeout, because wl-copy can hang on GNOME.
+- Every tool runs with a 3 s timeout, because wl-copy can hang on GNOME. Typing gets 3 s plus 50 ms a character: wtype types about 4 ms a character on a Pi 5, and being stopped partway leaves the text half typed, which is reported as a failure, not as "Copied".
 
 **Transcription (`internal/transcription`).**
 - Turn detection tolerates thinking pauses (`max_turn_silence` 5000 ms, `min_turn_silence` 700 ms, `end_of_turn_confidence_threshold` 0.85), so a dictation isn't split into one capitalised sentence per pause. The key release ends the last turn anyway.
 - These can be tuned with `T2_MAX_TURN_SILENCE_MS`, `T2_MIN_TURN_SILENCE_MS` and `T2_END_OF_TURN_CONFIDENCE`. `T2_TURN_DEFAULTS=1` uses the server's defaults.
 - The Begin message doesn't carry the speech model, so the model shown by `-v` is blank.
+- Billing safety nets: the session URL sets `inactivity_timeout=30`, so if t2 dies without terminating, billing stops after 30 s instead of at the 3-hour cap. `Finish` closes the socket even when the wait for termination fails. `terminationTimeout` is a safety net, not a latency setting: shortening it loses the last turn's punctuation.
+- The dial has its own 5 s connect and handshake timeouts. gorilla's default dialer waits 45 s with no connect timeout, which hangs a press on a dead network.
+- Formatted turns and drafts are kept apart (`formattedByTurn`, `latestDraftByTurn`): when they shared one map, a new draft overwrote the transcript. The first error is kept, not the last, because the server sends an Error frame with the reason and then a bare 1008 close.
 
 **Startup checks.** `Daemon.Run` collects `audio.Limitation()` and `clipboard.Limitation()` before starting the hotkey, and prints them even when that start fails, so a machine missing several things learns all of them in one run. On Linux, `audio.Limitation` asks `pactl` for the sources and warns when there is no microphone (only `.monitor` sources), when the default source is a monitor, or when the sound server can't be reached. `parecord` records a monitor without complaint, so without this check a machine with no microphone recorded what it was playing.
 
@@ -93,5 +102,5 @@ Files are split by build constraint. `*_darwin.go` (cgo where needed) and `*_lin
 ## Platform status
 
 - **macOS:** supported.
-- **Linux:** X11, and Wayland with the `input` group. Tested only in Docker: Xvfb, a uinput keyboard, a PulseAudio null sink, and one live dictation pasted on X11. Not yet run on a physical desktop.
+- **Linux:** X11, and Wayland with the `input` group. Tested in Docker (Xvfb, a uinput keyboard, a PulseAudio null sink, a headless Sway; one live dictation pasted on X11), and on a Raspberry Pi 5 with labwc over SSH: a uinput keyboard and a null-sink microphone, with live dictations typed into GTK3 apps. Not yet used with a physical keyboard and microphone.
 - **Windows:** stubs only.

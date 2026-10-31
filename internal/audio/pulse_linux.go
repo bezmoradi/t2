@@ -2,6 +2,7 @@ package audio
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -12,54 +13,59 @@ import (
 	"time"
 )
 
-// maxBuffered caps the audio held between the reader goroutine and the
-// capture loop. The loop drains it every few milliseconds, so this is only
-// reached if the loop stalls; past it the oldest audio is dropped and
-// counted as an overflow, as the device ring buffer does on macOS.
-const maxBuffered = SampleRate * 2 * 4 // 4s of mono int16
+const (
+	maxBufferedSeconds = 4
+	maxBufferedBytes   = SampleRate * BytesPerSample * maxBufferedSeconds
+	minLatencyMillis   = 10
+	pipeReadBytes      = 4096
+	pactlTimeout       = 2 * time.Second
+	parecordTermGrace  = time.Second
+	stderrTailBytes    = 512
+)
 
-// parecord captures through PulseAudio's client tool, which PipeWire's
-// pipewire-pulse serves as well. Running it as a process keeps the Linux
-// build free of cgo and of libpulse's headers, and makes the stop the
-// AudioQueue watchdog exists for impossible to hang: Close kills a process.
-//
-// The process lives only for one recording, so the microphone - and the
-// desktop's microphone-in-use indicator - is on only while the keys are held.
 type parecord struct {
 	cmd    *exec.Cmd
 	frames int
 
 	mu        sync.Mutex
-	buf       []byte // captured, not yet read: s16le
+	unreadLE  []byte
 	overflows int
 	exited    bool
 	waitErr   error
 
-	stderr tail
-	done   chan struct{} // closed once the process has exited and been reaped
+	stderr stderrTail
+	reaped chan struct{}
 }
 
 const noParecord = "audio capture needs parecord: install pulseaudio-utils (Debian, Ubuntu, Fedora) or libpulse (Arch); it works with PipeWire as well as PulseAudio"
 
-// OpenStream opens the default microphone by starting parecord.
+func killedWithT2() *syscall.SysProcAttr {
+	return &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
+}
+
+func installed(tool string) bool {
+	_, err := exec.LookPath(tool)
+	return err == nil
+}
+
+func isMonitor(source string) bool { return strings.HasSuffix(source, ".monitor") }
+
 func OpenStream(sampleRate, frames int) (Stream, error) {
 	path, err := exec.LookPath("parecord")
 	if err != nil {
 		return nil, errors.New(noParecord)
 	}
 
-	latency := max(frames*1000/sampleRate, 10)
-	p := &parecord{frames: frames, done: make(chan struct{})}
+	latencyMillis := max(frames*1000/sampleRate, minLatencyMillis)
+	p := &parecord{frames: frames, reaped: make(chan struct{})}
 	p.cmd = exec.Command(path,
 		"--raw", "--format=s16le",
 		fmt.Sprintf("--rate=%d", sampleRate), "--channels=1",
-		fmt.Sprintf("--latency-msec=%d", latency),
+		fmt.Sprintf("--latency-msec=%d", latencyMillis),
 		"--client-name=t2", "--stream-name=Dictation",
 	)
 	p.cmd.Stderr = &p.stderr
-	// If t2 dies without closing the stream, the microphone must not stay
-	// open behind it.
-	p.cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
+	p.cmd.SysProcAttr = killedWithT2()
 
 	out, err := p.cmd.StdoutPipe()
 	if err != nil {
@@ -72,20 +78,12 @@ func OpenStream(sampleRate, frames int) (Stream, error) {
 	return p, nil
 }
 
-// Limitation reports, for the startup banner, why recording will not work,
-// or "" when nothing is wrong that can be seen before the first hold.
-//
-// Without it, a missing microphone surfaced only once someone had held the
-// keys and spoken. Worse, on a machine with no microphone the default source
-// is usually the monitor of an output, which parecord records from happily:
-// the dictation came back as whatever the machine was playing - on an idle
-// one, silence, reported as "No speech detected".
 func Limitation() string {
-	if _, err := exec.LookPath("parecord"); err != nil {
+	if !installed("parecord") {
 		return noParecord
 	}
-	if _, err := exec.LookPath("pactl"); err != nil {
-		return "" // ships with parecord; without it there is nothing to ask
+	if !installed("pactl") {
+		return ""
 	}
 
 	out, err := pactl("list", "short", "sources")
@@ -94,44 +92,40 @@ func Limitation() string {
 	}
 	var mics, monitors []string
 	for _, line := range strings.Split(out, "\n") {
-		f := strings.Fields(line)
-		if len(f) < 2 {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
 			continue
 		}
-		if strings.HasSuffix(f[1], ".monitor") {
-			monitors = append(monitors, f[1])
+		source := fields[1]
+		if isMonitor(source) {
+			monitors = append(monitors, source)
 		} else {
-			mics = append(mics, f[1])
+			mics = append(mics, source)
 		}
 	}
 	if len(mics) == 0 {
 		return fmt.Sprintf("no microphone found: the sound server has only monitors of outputs (%s), which record what the computer plays, not your voice. Connect a microphone", strings.Join(monitors, ", "))
 	}
 
-	// parecord records from the default source. Older servers have no
-	// get-default-source; then this check is skipped.
-	if def, err := pactl("get-default-source"); err == nil && strings.HasSuffix(def, ".monitor") {
-		return fmt.Sprintf("the default input is %s, a monitor of an output, which records what the computer plays, not your voice: choose a microphone in %s", def, SoundSettings())
+	if defaultSource, err := pactl("get-default-source"); err == nil && isMonitor(defaultSource) {
+		return fmt.Sprintf("the default input is %s, a monitor of an output, which records what the computer plays, not your voice: choose a microphone in %s", defaultSource, SoundSettings())
 	}
 	return ""
 }
 
-// pactl runs one pactl query, bounded so a wedged sound server cannot hold
-// up startup.
 func pactl(args ...string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), pactlTimeout)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, "pactl", args...).Output()
 	if ctx.Err() != nil {
-		return "", errors.New("no answer within 2s")
+		return "", fmt.Errorf("no answer within %v", pactlTimeout)
 	}
 	if err != nil {
-		// pactl explains itself on stderr ("Connection failure: ...");
-		// the exit status alone says nothing.
-		var ee *exec.ExitError
-		if errors.As(err, &ee) {
-			if msg := strings.TrimSpace(string(ee.Stderr)); msg != "" {
-				return "", errors.New(strings.SplitN(msg, "\n", 2)[0])
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			if stderr := strings.TrimSpace(string(exitErr.Stderr)); stderr != "" {
+				firstLine := strings.SplitN(stderr, "\n", 2)[0]
+				return "", errors.New(firstLine)
 			}
 		}
 		return "", err
@@ -139,19 +133,18 @@ func pactl(args ...string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-// pump moves audio from the process into buf until the process ends.
 func (p *parecord) pump(out io.Reader) {
-	defer close(p.done)
+	defer close(p.reaped)
 
-	chunk := make([]byte, 4096)
+	chunk := make([]byte, pipeReadBytes)
 	for {
 		n, err := out.Read(chunk)
 		if n > 0 {
 			p.mu.Lock()
-			p.buf = append(p.buf, chunk[:n]...)
-			if over := len(p.buf) - maxBuffered; over > 0 {
-				over += over % 2 // drop whole samples
-				p.buf = p.buf[over:]
+			p.unreadLE = append(p.unreadLE, chunk[:n]...)
+			if excess := len(p.unreadLE) - maxBufferedBytes; excess > 0 {
+				excess += excess % BytesPerSample
+				p.unreadLE = p.unreadLE[excess:]
 				p.overflows++
 			}
 			p.mu.Unlock()
@@ -161,10 +154,10 @@ func (p *parecord) pump(out io.Reader) {
 		}
 	}
 
-	werr := p.cmd.Wait()
+	waitErr := p.cmd.Wait()
 	p.mu.Lock()
 	p.exited = true
-	p.waitErr = werr
+	p.waitErr = waitErr
 	p.mu.Unlock()
 }
 
@@ -172,10 +165,8 @@ func (p *parecord) Available() (int, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	n := len(p.buf) / 2
-	if p.exited && n < p.frames {
-		// parecord only exits on its own when it cannot record: no sound
-		// server, no source, the server going away.
+	buffered := len(p.unreadLE) / BytesPerSample
+	if p.exited && buffered < p.frames {
 		msg := p.stderr.String()
 		if msg == "" && p.waitErr != nil {
 			msg = p.waitErr.Error()
@@ -183,22 +174,22 @@ func (p *parecord) Available() (int, error) {
 		if msg == "" {
 			msg = "it exited"
 		}
-		return n, fmt.Errorf("parecord stopped: %s", msg)
+		return buffered, fmt.Errorf("parecord stopped: %s", msg)
 	}
-	return n, nil
+	return buffered, nil
 }
 
 func (p *parecord) Read(into []int16) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if len(p.buf) < len(into)*2 {
-		return fmt.Errorf("microphone read: %d of %d frames buffered", len(p.buf)/2, len(into))
+	if len(p.unreadLE) < len(into)*BytesPerSample {
+		return fmt.Errorf("microphone read: %d of %d frames buffered", len(p.unreadLE)/BytesPerSample, len(into))
 	}
 	for i := range into {
-		into[i] = int16(uint16(p.buf[2*i]) | uint16(p.buf[2*i+1])<<8)
+		into[i] = int16(binary.LittleEndian.Uint16(p.unreadLE[BytesPerSample*i:]))
 	}
-	p.buf = p.buf[len(into)*2:]
+	p.unreadLE = p.unreadLE[len(into)*BytesPerSample:]
 	return nil
 }
 
@@ -211,32 +202,30 @@ func (p *parecord) Overflows() int {
 func (p *parecord) Close() error {
 	p.cmd.Process.Signal(syscall.SIGTERM)
 	select {
-	case <-p.done:
-	case <-time.After(time.Second):
+	case <-p.reaped:
+	case <-time.After(parecordTermGrace):
 		p.cmd.Process.Kill()
-		<-p.done
+		<-p.reaped
 	}
 	return nil
 }
 
-// tail keeps the last few hundred bytes written to it, on one line:
-// parecord's error message, without letting a chatty process grow it.
-type tail struct {
+type stderrTail struct {
 	mu  sync.Mutex
 	buf []byte
 }
 
-func (t *tail) Write(b []byte) (int, error) {
+func (t *stderrTail) Write(b []byte) (int, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.buf = append(t.buf, b...)
-	if over := len(t.buf) - 512; over > 0 {
-		t.buf = t.buf[over:]
+	if excess := len(t.buf) - stderrTailBytes; excess > 0 {
+		t.buf = t.buf[excess:]
 	}
 	return len(b), nil
 }
 
-func (t *tail) String() string {
+func (t *stderrTail) String() string {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return strings.Join(strings.Fields(strings.ReplaceAll(string(t.buf), "\n", " ; ")), " ")

@@ -8,26 +8,25 @@ import (
 	"os/exec"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
-// PasteKeys is the keystroke that pastes, as the user is told to press it.
-// Terminals paste with Ctrl+Shift+V instead; t2 cannot tell which app has
-// focus, so it sends Ctrl+V and the text stays on the clipboard either way.
 const PasteKeys = "Ctrl+V"
 
-// toolTimeout bounds every clipboard and keystroke tool. wl-copy can hang
-// on a compositor without a data-control protocol (GNOME), where it falls
-// back to briefly showing a window that has to receive focus.
-const toolTimeout = 3 * time.Second
+const (
+	toolTimeout          = 3 * time.Second
+	typingTimeoutPerChar = 50 * time.Millisecond
+	clipboardSettleDelay = 100 * time.Millisecond
+	forceUTF8Locale      = "LC_ALL=C.UTF-8"
+)
 
-// wayland reports whether this is a Wayland session. X11 tools still run
-// there, through XWayland, but only reach X11 windows.
-func wayland() bool { return os.Getenv("WAYLAND_DISPLAY") != "" }
+var errToolTimedOut = errors.New("did not finish in time")
 
-// tool is a command line with the package that provides it.
+func waylandSession() bool { return os.Getenv("WAYLAND_DISPLAY") != "" }
+
 type tool struct {
-	pkg  string
-	args []string
+	packageName string
+	args        []string
 }
 
 func (t tool) available() bool {
@@ -36,67 +35,63 @@ func (t tool) available() bool {
 }
 
 var (
-	wlCopy  = tool{"wl-clipboard", []string{"wl-copy"}}
-	xclip   = tool{"xclip", []string{"xclip", "-selection", "clipboard", "-in"}}
-	xsel    = tool{"xsel", []string{"xsel", "--clipboard", "--input"}}
-	wtype   = tool{"wtype", []string{"wtype", "-M", "ctrl", "-k", "v", "-m", "ctrl"}}
-	xdotool = tool{"xdotool", []string{"xdotool", "key", "--clearmodifiers", "ctrl+v"}}
+	wlCopy             = tool{"wl-clipboard", []string{"wl-copy"}}
+	xclip              = tool{"xclip", []string{"xclip", "-selection", "clipboard", "-in"}}
+	xsel               = tool{"xsel", []string{"xsel", "--clipboard", "--input"}}
+	wtypeTextFromStdin = tool{"wtype", []string{"wtype", "-"}}
+	xdotoolCtrlV       = tool{"xdotool", []string{"xdotool", "key", "--clearmodifiers", "ctrl+v"}}
 )
 
 func copyTools() []tool {
-	if wayland() {
+	if waylandSession() {
 		return []tool{wlCopy}
 	}
 	return []tool{xclip, xsel}
 }
 
-func keyTool() tool {
-	if wayland() {
-		return wtype
+func keystrokeTool() tool {
+	if waylandSession() {
+		return wtypeTextFromStdin
 	}
-	return xdotool
+	return xdotoolCtrlV
 }
 
-// Limitation reports, for the startup banner, why transcripts will not be
-// pasted on this desktop, or "" when nothing is missing.
 func Limitation() string {
 	tools := copyTools()
-	found := false
+	canCopy := false
 	for _, t := range tools {
-		found = found || t.available()
+		canCopy = canCopy || t.available()
 	}
-	if !found {
-		return fmt.Sprintf("no clipboard tool found: install %s", tools[0].pkg)
-	}
-	if k := keyTool(); !k.available() {
-		if wayland() {
-			// wtype only works on compositors with the virtual-keyboard
-			// protocol, so it is not worth recommending on GNOME or KDE.
-			return fmt.Sprintf("wtype not found, so transcripts are copied but not pasted: press %s yourself (on Sway, Hyprland and other wlroots compositors, installing wtype lets t2 paste)", PasteKeys)
-		}
-		return fmt.Sprintf("%s not found, so transcripts are copied but not pasted: install %s, or press %s yourself", k.args[0], k.pkg, PasteKeys)
+	k := keystrokeTool()
+	switch {
+	case !canCopy && !k.available() && waylandSession():
+		return fmt.Sprintf("no clipboard tool found: install %s, and wtype too on labwc, Sway, Hyprland and other wlroots compositors, so t2 can type transcripts", tools[0].packageName)
+	case !canCopy && !k.available():
+		return fmt.Sprintf("no clipboard tool found: install %s, and %s too, so t2 can paste", tools[0].packageName, k.packageName)
+	case !canCopy:
+		return fmt.Sprintf("no clipboard tool found: install %s", tools[0].packageName)
+	case !k.available() && waylandSession():
+		return fmt.Sprintf("wtype not found, so transcripts are copied but not typed: press %s yourself (on labwc, Sway, Hyprland and other wlroots compositors, installing wtype lets t2 type them)", PasteKeys)
+	case !k.available():
+		return fmt.Sprintf("%s not found, so transcripts are copied but not pasted: install %s, or press %s yourself", k.args[0], k.packageName, PasteKeys)
 	}
 	return ""
 }
 
-// run starts a tool with text on its input and waits for it, within
-// toolTimeout.
-//
-// Its output is deliberately not captured. The clipboard tools fork a child
-// that keeps serving the text until something else is copied, and that child
-// inherits any pipe given for output, so collecting stdout or stderr would
-// wait for the next copy, not for this one.
-func run(t tool, input string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), toolTimeout)
+func runWithoutCapturingOutput(t tool, input string, timeout time.Duration, extraEnv ...string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, t.args[0], t.args[1:]...)
 	if input != "" {
 		cmd.Stdin = strings.NewReader(input)
 	}
+	if len(extraEnv) > 0 {
+		cmd.Env = append(os.Environ(), extraEnv...)
+	}
 	err := cmd.Run()
 	if ctx.Err() != nil {
-		return fmt.Errorf("%s did not finish within %v", t.args[0], toolTimeout)
+		return fmt.Errorf("%s %w (%v)", t.args[0], errToolTimedOut, timeout)
 	}
 	if err != nil {
 		return fmt.Errorf("%s: %v", t.args[0], err)
@@ -104,7 +99,6 @@ func run(t tool, input string) error {
 	return nil
 }
 
-// CopyText puts text on the clipboard without pasting it.
 func CopyText(text string) error {
 	if text == "" {
 		return fmt.Errorf("empty text")
@@ -116,46 +110,60 @@ func CopyText(text string) error {
 		if !t.available() {
 			continue
 		}
-		err := run(t, text)
+		err := runWithoutCapturingOutput(t, text, toolTimeout)
 		if err == nil {
 			return nil
 		}
 		errs = append(errs, err)
 	}
 	if len(errs) == 0 {
-		return fmt.Errorf("failed to copy to clipboard: no clipboard tool found, install %s", tools[0].pkg)
+		return fmt.Errorf("failed to copy to clipboard: no clipboard tool found, install %s", tools[0].packageName)
 	}
 	return fmt.Errorf("failed to copy to clipboard: %v", errors.Join(errs...))
 }
 
-// PasteTextSafely copies text to the clipboard and sends Ctrl+V.
-//
-// When the desktop takes no synthetic keystrokes - GNOME and KDE on Wayland
-// support neither wtype's protocol nor any other an unprivileged program can
-// use - the result is ErrCopiedOnly: the text is on the clipboard and the
-// user pastes it.
-func PasteTextSafely(text string) error {
+func PasteOnce(text string) error {
+	if waylandSession() {
+		return copyThenType(text)
+	}
+
 	if err := CopyText(text); err != nil {
 		return err
 	}
-
-	k := keyTool()
-	if !k.available() {
-		return fmt.Errorf("%w (%s is not installed)", ErrCopiedOnly, k.args[0])
+	if !xdotoolCtrlV.available() {
+		return fmt.Errorf("%w (xdotool is not installed)", ErrCopiedOnly)
 	}
 
-	// Small delay to ensure clipboard is set
-	time.Sleep(100 * time.Millisecond)
+	time.Sleep(clipboardSettleDelay)
 
-	// Sent exactly once, as on macOS: a keystroke tool can fail after the
-	// keystroke went out, and a second paste corrupts what is being typed.
-	if err := run(k, ""); err != nil {
-		if wayland() {
-			// wtype exits at once on a compositor without the
-			// virtual-keyboard protocol, before sending anything.
-			return fmt.Errorf("%w (%v)", ErrCopiedOnly, err)
-		}
+	if err := runWithoutCapturingOutput(xdotoolCtrlV, "", toolTimeout); err != nil {
 		return fmt.Errorf("paste keystroke failed (text is on the clipboard, press %s): %v", PasteKeys, err)
 	}
 	return nil
+}
+
+func copyThenType(text string) error {
+	copyErr := CopyText(text)
+	if !wtypeTextFromStdin.available() {
+		if copyErr != nil {
+			return copyErr
+		}
+		return fmt.Errorf("%w (wtype is not installed)", ErrCopiedOnly)
+	}
+
+	typingTimeout := toolTimeout + time.Duration(utf8.RuneCountInString(text))*typingTimeoutPerChar
+	err := runWithoutCapturingOutput(wtypeTextFromStdin, text, typingTimeout, forceUTF8Locale)
+	stoppedPartway := errors.Is(err, errToolTimedOut)
+	switch {
+	case err == nil:
+		return nil
+	case stoppedPartway && copyErr != nil:
+		return fmt.Errorf("typing was stopped after %v, so the text may be incomplete; it could not be copied either: %v", typingTimeout.Round(time.Second), copyErr)
+	case stoppedPartway:
+		return fmt.Errorf("typing was stopped after %v, so the text may be incomplete (the full text is on the clipboard, press %s)", typingTimeout.Round(time.Second), PasteKeys)
+	case copyErr != nil:
+		return fmt.Errorf("could not type the text (%v), and %v", err, copyErr)
+	default:
+		return fmt.Errorf("%w (%v)", ErrCopiedOnly, err)
+	}
 }

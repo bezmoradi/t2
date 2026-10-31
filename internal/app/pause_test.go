@@ -50,6 +50,7 @@ func TestPauseTolerance(t *testing.T) {
 		}
 		time.Sleep(500 * time.Millisecond)
 		d.OnRelease(hotkeys.Release{Held: time.Since(started)})
+		d.waitIdle(time.Minute)
 
 		t.Logf("%s\n   -> %s", label, got)
 		return got

@@ -14,11 +14,14 @@ T2 is a CLI application written in Go that transforms your voice into text using
 
 ## Prerequisites
 
-Mac users need to run the following command to install the prerequisites:
+Mac users need Go and Apple's Command Line Tools. t2 calls macOS audio and keyboard frameworks through cgo, which needs a C compiler:
 
 ```sh
 $ brew install go
+$ xcode-select --install
 ```
+
+Without the Command Line Tools the install still succeeds, but t2 stops at startup with a message saying so.
 
 ### Add Go to Your PATH
 
@@ -71,15 +74,16 @@ If the installation process goes well, from now on you can run the `t2` command 
 When you run the app for the first time, you'll see:
 
 ```text
-AssemblyAI API key not found.
 🔑 AssemblyAI API key not found.
 📋 To get your free API key:
    1. Visit: https://www.assemblyai.com
    2. Sign up and get your API key from the dashboard
    3. You get 5 hours of free transcription monthly
 
-🔐 Please enter your AssemblyAI API key:
+🔐 Please enter your AssemblyAI API key (input is hidden):
 ```
+
+The key is saved to `~/.config/t2/config.json`, readable by you only.
 
 ## Usage
 
@@ -90,6 +94,14 @@ AssemblyAI API key not found.
 5. **Wait**: AI processes your audio (shows progress)
 6. **Auto-paste**: Text is automatically pasted to your active application
 
+Good to know:
+
+-   You can start the next dictation straight away. It records from the moment you press, while the previous one is still being transcribed. Results are pasted in the order you spoke them, each once you've let go of the keys.
+-   Presses shorter than 0.4 seconds are ignored, and never connect to AssemblyAI.
+-   Pressing any other key while holding Ctrl + Shift (a shortcut such as Ctrl + Shift + Tab) stops the recording at once, without transcribing it. If you had been talking for 3 seconds or more, the audio is saved (see below).
+-   If a recording can't be transcribed in full (no network, a dropped connection, a cancelled dictation), the audio is saved to `~/.config/t2/last-recording.wav`, readable by you only. There is one such file: the next failure replaces it, and the next successful transcription deletes it.
+-   Only one t2 can run at a time; a second one exits with a message.
+
 ## Application Commands
 
 ```sh
@@ -99,7 +111,7 @@ AssemblyAI API key not found.
 # Show config file location
 ./t2 --show-config
 
-# Reset API key (removes saved config)
+# Reset API key (removes the saved key; you're prompted for a new one)
 ./t2 --reset-key
 ```
 
@@ -127,9 +139,11 @@ $ ./t2
 
 Your API key is read in this order:
 
-1. `.env` file in the current directory
+1. The `ASSEMBLYAI_API_KEY` environment variable
 2. User config file at `~/.config/t2/config.json` (recommended)
-3. Interactive prompt (first-time setup)
+3. Interactive prompt (first-time setup), whose answer is saved to that file
+
+No `.env` file is read.
 
 ## Supported Platforms
 

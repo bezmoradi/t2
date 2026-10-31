@@ -73,21 +73,23 @@ type Stream interface {
 	Close() error
 }
 
-// framesPerBuffer is the chunk size requested from the device. A variable so
-// tests can shrink it: a tiny buffer multiplies the device's IO cycles and
-// stop handshakes, which is what made PortAudio's CoreAudio deadlock
-// reproducible in seconds and is how the replacement is stress-tested.
-var framesPerBuffer = Frames
-
-// framesEnv overrides framesPerBuffer for diagnostics, e.g.
-// T2_FRAMES_PER_BUFFER=32 on the real binary.
-const framesEnv = "T2_FRAMES_PER_BUFFER"
+// framesEnv overrides the chunk size requested from the device, for
+// diagnostics: T2_FRAMES_PER_BUFFER=32 on the real binary. A tiny buffer
+// multiplies the device's IO cycles and stop handshakes, which is what made
+// PortAudio's CoreAudio deadlock reproducible in seconds and is how the
+// replacement is stress-tested. Values outside minFrames..maxFrames are
+// ignored rather than handed to the audio layer.
+const (
+	framesEnv = "T2_FRAMES_PER_BUFFER"
+	minFrames = 32
+	maxFrames = 8192
+)
 
 func chunkFrames() int {
-	if v, err := strconv.Atoi(os.Getenv(framesEnv)); err == nil && v > 0 {
+	if v, err := strconv.Atoi(os.Getenv(framesEnv)); err == nil && v >= minFrames && v <= maxFrames {
 		return v
 	}
-	return framesPerBuffer
+	return Frames
 }
 
 // Outcome describes how a recording ended. Anything other than a clean stop
@@ -113,17 +115,16 @@ type Outcome struct {
 	Wedged bool
 }
 
-// Incomplete reports whether the recording ended early or lost audio.
-func (o Outcome) Incomplete() bool { return o.Err != nil || o.Overflows > 0 }
-
 // Recorder captures from the default microphone, one recording at a time.
 type Recorder struct {
 	mu      sync.Mutex
-	send    func([]byte) error
+	send    func([]byte)
 	current *capture // in-flight recording; nil when idle
 }
 
-func NewRecorder(audioCallback func([]byte) error) *Recorder {
+// NewRecorder returns a recorder that hands every captured chunk to
+// audioCallback, on the capture goroutine. The callback must not block.
+func NewRecorder(audioCallback func([]byte)) *Recorder {
 	return &Recorder{send: audioCallback}
 }
 
@@ -231,15 +232,11 @@ func (r *Recorder) Stop() Outcome {
 // its own state and stream, so nothing it does later can reach the next
 // recording; Start refuses until it returns, which for a real hang is never.
 func (r *Recorder) abandon(c *capture) Outcome {
-	r.mu.Lock()
 	abandoned.Add(1)
-	r.mu.Unlock()
 
 	go func() {
 		<-c.done
-		r.mu.Lock()
 		abandoned.Add(-1)
-		r.mu.Unlock()
 	}()
 
 	out := c.outcome()
@@ -253,7 +250,7 @@ func (r *Recorder) abandon(c *capture) Outcome {
 type capture struct {
 	stream Stream
 	in     []int16
-	send   func([]byte) error
+	send   func([]byte)
 
 	stop     chan struct{} // closed by Stop
 	loopDone chan struct{} // closed by run once the loop has exited
@@ -341,17 +338,12 @@ func (c *capture) loop() {
 		c.overflows = c.stream.Overflows()
 		c.mu.Unlock()
 
-		if c.send == nil {
-			continue
-		}
-
-		// Every captured chunk is sent. Withholding audio during leading silence
-		// used to be an optimisation for per-audio-second billing, but the API
-		// bills wall-clock session time, so it saved nothing and only made the
-		// stream discontinuous.
-		if err := c.send(pcm); err != nil {
-			c.fail(err)
-			return
+		// Every captured chunk is handed on. Withholding audio during leading
+		// silence used to be an optimisation for per-audio-second billing, but
+		// the API bills wall-clock session time, so it saved nothing and only
+		// made the stream discontinuous.
+		if c.send != nil {
+			c.send(pcm)
 		}
 	}
 }

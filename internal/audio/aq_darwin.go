@@ -1,4 +1,4 @@
-//go:build darwin
+//go:build darwin && cgo
 
 package audio
 
@@ -32,6 +32,9 @@ func openAudioQueue(sampleRate, frames int) (Stream, error) {
 	var status C.int
 	s := C.t2_stream_open(C.int(sampleRate), C.int(frames), &status)
 	if s == nil {
+		if status == C.T2_ERR_NOMEM {
+			return nil, fmt.Errorf("opening the microphone: out of memory for %d-frame buffers", frames)
+		}
 		return nil, fmt.Errorf("opening the microphone: AudioQueue error %d", int(status))
 	}
 	return &audioQueue{s: s}, nil

@@ -4,15 +4,22 @@ import (
 	"encoding/binary"
 	"fmt"
 	"os"
+	"path/filepath"
 )
 
-// WriteWAV writes mono 16-bit PCM at SampleRate to path.
+// WriteWAV writes mono 16-bit PCM at SampleRate to path, readable by the
+// user only.
 //
 // This exists so that no failure anywhere in the pipeline - a dial that timed
 // out, a connection that dropped mid-sentence, a paste that would not go
 // through - costs the user audio they already spoke. Whatever was captured
 // lands on disk and the path is printed.
-func WriteWAV(path string, pcm []byte) error {
+//
+// It is a recording of the user's voice, so it is written to a temporary file
+// - which os.CreateTemp makes 0600 - and renamed over path. Creating path
+// directly gave 0644 under the usual umask, and an existing file kept
+// whatever mode it already had.
+func WriteWAV(path string, pcm []byte) (err error) {
 	const (
 		channels      = 1
 		bitsPerSample = 16
@@ -21,11 +28,16 @@ func WriteWAV(path string, pcm []byte) error {
 	byteRate := SampleRate * channels * bitsPerSample / 8
 	blockAlign := channels * bitsPerSample / 8
 
-	f, err := os.Create(path)
+	f, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".*")
 	if err != nil {
 		return fmt.Errorf("creating %s: %w", path, err)
 	}
-	defer f.Close()
+	defer func() {
+		if err != nil {
+			f.Close()
+			os.Remove(f.Name())
+		}
+	}()
 
 	le := binary.LittleEndian
 	header := make([]byte, 0, 44)
@@ -54,6 +66,11 @@ func WriteWAV(path string, pcm []byte) error {
 	if _, err := f.Write(pcm); err != nil {
 		return fmt.Errorf("writing %s: %w", path, err)
 	}
-
-	return f.Close()
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("writing %s: %w", path, err)
+	}
+	if err := os.Rename(f.Name(), path); err != nil {
+		return fmt.Errorf("saving %s: %w", path, err)
+	}
+	return nil
 }

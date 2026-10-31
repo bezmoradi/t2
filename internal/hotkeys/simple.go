@@ -1,4 +1,4 @@
-//go:build darwin
+//go:build darwin && cgo
 
 package hotkeys
 
@@ -61,8 +61,9 @@ type edge struct {
 	pressed bool
 	at      time.Time
 
-	// cancelled marks a hold aborted because another key went down, so the
-	// handler can discard the recording instead of transcribing a shortcut.
+	// cancelled marks a release the poller produced because another key went
+	// down mid-hold, with Ctrl+Shift still physically down, so the handler can
+	// stop and discard the recording instead of transcribing a shortcut.
 	cancelled bool
 
 	// capped marks a release the poller produced at the hold limit, with the
@@ -70,7 +71,9 @@ type edge struct {
 	capped bool
 }
 
-type SimpleHotkeyManager struct {
+// Manager polls the keyboard for the Ctrl+Shift hold and turns it into
+// OnPress and OnRelease calls on one goroutine, in order.
+type Manager struct {
 	handler EventHandler
 
 	// Both edges share one ordered channel. They used to be two separate
@@ -88,8 +91,8 @@ type SimpleHotkeyManager struct {
 	maxHold    time.Duration
 }
 
-func NewSimpleManager(handler EventHandler) *SimpleHotkeyManager {
-	return &SimpleHotkeyManager{
+func NewManager(handler EventHandler) *Manager {
+	return &Manager{
 		handler:    handler,
 		events:     make(chan edge, eventBuffer),
 		done:       make(chan struct{}),
@@ -99,16 +102,16 @@ func NewSimpleManager(handler EventHandler) *SimpleHotkeyManager {
 	}
 }
 
-func (s *SimpleHotkeyManager) Start() error {
+func (s *Manager) Start() error {
 	go s.pollKeyState()
 	return nil
 }
 
-func (s *SimpleHotkeyManager) Stop() {
+func (s *Manager) Stop() {
 	s.stopOnce.Do(func() { close(s.done) })
 }
 
-func (s *SimpleHotkeyManager) Listen() {
+func (s *Manager) Listen() {
 	for {
 		select {
 		case e := <-s.events:
@@ -141,7 +144,7 @@ func (s *SimpleHotkeyManager) Listen() {
 
 // waitForRelease blocks until the release edge matching the press we just
 // handled arrives. The bool is false if the manager was stopped first.
-func (s *SimpleHotkeyManager) waitForRelease() (edge, bool) {
+func (s *Manager) waitForRelease() (edge, bool) {
 	for {
 		select {
 		case e := <-s.events:
@@ -155,17 +158,18 @@ func (s *SimpleHotkeyManager) waitForRelease() (edge, bool) {
 	}
 }
 
-func (s *SimpleHotkeyManager) pollKeyState() {
+func (s *Manager) pollKeyState() {
 	var (
 		wasPressed bool
 		pressedAt  time.Time
-		cancelled  bool
 
-		// capped is set once a hold has been force-released at the limit.
-		// Until the keys physically come up the poller then ignores them: it
-		// must not start another recording off a modifier that is stuck
-		// down, and it must not report the eventual real release twice.
-		capped bool
+		// ended is set once the poller has reported a release itself, with
+		// the keys still down: at the hold limit, or because another key
+		// went down. Until the keys physically come up the poller then
+		// ignores them: it must not start another recording off a modifier
+		// that is stuck down, and it must not report the eventual real
+		// release twice.
+		ended bool
 	)
 
 	ticker := time.NewTicker(pollInterval)
@@ -194,35 +198,37 @@ func (s *SimpleHotkeyManager) pollKeyState() {
 			}
 
 		case isPressed && wasPressed:
-			if capped {
+			if ended {
 				continue
 			}
 			// A non-modifier key going down mid-hold means this was a
-			// shortcut, not dictation. Latch it so the release reports the
-			// hold as cancelled.
-			if !cancelled && s.otherDown() {
-				cancelled = true
-			}
-			if now.Sub(pressedAt) >= s.maxHold {
-				capped = true
-				if !s.emit(edge{pressed: false, at: now, cancelled: cancelled, capped: true}) {
+			// shortcut, not dictation. End the hold now: waiting for the keys
+			// to come up kept recording, and streaming the room to the
+			// server, for as long as they were held.
+			if s.otherDown() {
+				ended = true
+				if !s.emit(edge{pressed: false, at: now, cancelled: true}) {
 					return
 				}
-				cancelled = false
+				continue
+			}
+			if now.Sub(pressedAt) >= s.maxHold {
+				ended = true
+				if !s.emit(edge{pressed: false, at: now, capped: true}) {
+					return
+				}
 			}
 
 		case !isPressed && wasPressed:
 			wasPressed = false
-			if capped {
-				// Already reported at the limit.
-				capped = false
-				cancelled = false
+			if ended {
+				// Already reported.
+				ended = false
 				continue
 			}
-			if !s.emit(edge{pressed: false, at: now, cancelled: cancelled}) {
+			if !s.emit(edge{pressed: false, at: now}) {
 				return
 			}
-			cancelled = false
 		}
 	}
 }
@@ -231,7 +237,7 @@ func (s *SimpleHotkeyManager) pollKeyState() {
 // poller stalls here rather than discarding, because a lost release edge
 // leaves the microphone recording with nothing to stop it. It reports false
 // if the manager was stopped instead.
-func (s *SimpleHotkeyManager) emit(e edge) bool {
+func (s *Manager) emit(e edge) bool {
 	select {
 	case s.events <- e:
 		return true
@@ -243,6 +249,11 @@ func (s *SimpleHotkeyManager) emit(e edge) bool {
 func ctrlShiftDown() bool {
 	return int(C.checkModifierKeys()) == 1
 }
+
+// HotkeyDown reports whether Ctrl+Shift is physically held right now. The
+// daemon checks it before synthesising Cmd+V, which with the hotkey held would
+// arrive as Ctrl+Shift+Cmd+V.
+func HotkeyDown() bool { return ctrlShiftDown() }
 
 func otherKeyDown() bool {
 	return int(C.anyNonModifierKeyDown()) == 1

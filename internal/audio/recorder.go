@@ -27,8 +27,7 @@ const (
 	ignoreLeadingChunks = 3
 )
 
-// Timeouts are variables so tests can shorten them.
-var (
+const (
 	// pollInterval is how long the capture loop waits when the device has
 	// less than one chunk ready. Every wait happens here, in Go, where Stop
 	// can interrupt it; the loop never blocks inside the audio layer.
@@ -52,7 +51,7 @@ var (
 
 // ErrWedged reports that a previous recording's stream never shut down, so
 // this process's audio layer is unusable until the process restarts.
-var ErrWedged = errors.New("the audio layer is stuck inside CoreAudio; t2 has to restart")
+var ErrWedged = errors.New("the audio layer is stuck inside " + Backend() + "; t2 has to restart")
 
 // Stream is one open capture from the default microphone: mono int16 at
 // SampleRate. OpenStream provides the platform's implementation.
@@ -76,8 +75,7 @@ type Stream interface {
 // framesEnv overrides the chunk size requested from the device, for
 // diagnostics: T2_FRAMES_PER_BUFFER=32 on the real binary. A tiny buffer
 // multiplies the device's IO cycles and stop handshakes, which is what made
-// PortAudio's CoreAudio deadlock reproducible in seconds and is how the
-// replacement is stress-tested. Values outside minFrames..maxFrames are
+// PortAudio's CoreAudio deadlock reproducible in seconds. Values outside minFrames..maxFrames are
 // ignored rather than handed to the audio layer.
 const (
 	framesEnv = "T2_FRAMES_PER_BUFFER"

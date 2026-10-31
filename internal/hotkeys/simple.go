@@ -1,43 +1,6 @@
-//go:build darwin && cgo
+//go:build (darwin && cgo) || linux
 
 package hotkeys
-
-/*
-#cgo CFLAGS: -x objective-c
-#cgo LDFLAGS: -framework CoreGraphics -framework Carbon
-#include <CoreGraphics/CoreGraphics.h>
-#include <Carbon/Carbon.h>
-
-// checkModifierKeys reports whether Ctrl+Shift is held on its own.
-//
-// Command and Option are rejected rather than ignored: Cmd+Ctrl+Shift+4 is
-// screenshot-to-clipboard, which would otherwise start a recording and then
-// race the screenshot for the pasteboard.
-int checkModifierKeys() {
-    CGEventFlags flags = CGEventSourceFlagsState(kCGEventSourceStateHIDSystemState);
-    int ctrl  = (flags & kCGEventFlagMaskControl) != 0;
-    int shift = (flags & kCGEventFlagMaskShift) != 0;
-    int cmd   = (flags & kCGEventFlagMaskCommand) != 0;
-    int alt   = (flags & kCGEventFlagMaskAlternate) != 0;
-    return ctrl && shift && !cmd && !alt;
-}
-
-// anyNonModifierKeyDown reports whether an ordinary key is held.
-//
-// Dictation means "Ctrl+Shift and nothing else". Virtual keycodes 0x36-0x3F are
-// the modifier keys themselves and are skipped; everything else being down means
-// this is a shortcut like Ctrl+Shift+T or Ctrl+Shift+Tab, not a dictation hold.
-int anyNonModifierKeyDown() {
-    for (int k = 0; k < 128; k++) {
-        if (k >= 0x36 && k <= 0x3F) continue;
-        if (CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, (CGKeyCode)k)) {
-            return 1;
-        }
-    }
-    return 0;
-}
-*/
-import "C"
 
 import (
 	"sync"
@@ -83,29 +46,28 @@ type Manager struct {
 	events   chan edge
 	done     chan struct{}
 	stopOnce sync.Once
-
-	// The key-state probes and the hold limit are fields so the poller can be
-	// driven by tests without a keyboard.
-	hotkeyDown func() bool
-	otherDown  func() bool
-	maxHold    time.Duration
 }
 
 func NewManager(handler EventHandler) *Manager {
 	return &Manager{
-		handler:    handler,
-		events:     make(chan edge, eventBuffer),
-		done:       make(chan struct{}),
-		hotkeyDown: ctrlShiftDown,
-		otherDown:  otherKeyDown,
-		maxHold:    MaxHold,
+		handler: handler,
+		events:  make(chan edge, eventBuffer),
+		done:    make(chan struct{}),
 	}
 }
 
+// Start opens the keyboard and begins polling it.
 func (s *Manager) Start() error {
+	if err := openKeyboard(); err != nil {
+		return err
+	}
 	go s.pollKeyState()
 	return nil
 }
+
+// Source names what the keys are read through, for the startup banner; it
+// is empty where there is only one way.
+func (s *Manager) Source() string { return keyboardSource() }
 
 func (s *Manager) Stop() {
 	s.stopOnce.Do(func() { close(s.done) })
@@ -183,12 +145,12 @@ func (s *Manager) pollKeyState() {
 		}
 
 		now := time.Now()
-		isPressed := s.hotkeyDown()
+		isPressed := ctrlShiftDown()
 
 		switch {
 		case isPressed && !wasPressed:
 			// Never start a hold that already has another key down.
-			if s.otherDown() {
+			if otherKeyDown() {
 				continue
 			}
 			wasPressed = true
@@ -205,14 +167,14 @@ func (s *Manager) pollKeyState() {
 			// shortcut, not dictation. End the hold now: waiting for the keys
 			// to come up kept recording, and streaming the room to the
 			// server, for as long as they were held.
-			if s.otherDown() {
+			if otherKeyDown() {
 				ended = true
 				if !s.emit(edge{pressed: false, at: now, cancelled: true}) {
 					return
 				}
 				continue
 			}
-			if now.Sub(pressedAt) >= s.maxHold {
+			if now.Sub(pressedAt) >= MaxHold {
 				ended = true
 				if !s.emit(edge{pressed: false, at: now, capped: true}) {
 					return
@@ -244,17 +206,4 @@ func (s *Manager) emit(e edge) bool {
 	case <-s.done:
 		return false
 	}
-}
-
-func ctrlShiftDown() bool {
-	return int(C.checkModifierKeys()) == 1
-}
-
-// HotkeyDown reports whether Ctrl+Shift is physically held right now. The
-// daemon checks it before synthesising Cmd+V, which with the hotkey held would
-// arrive as Ctrl+Shift+Cmd+V.
-func HotkeyDown() bool { return ctrlShiftDown() }
-
-func otherKeyDown() bool {
-	return int(C.anyNonModifierKeyDown()) == 1
 }

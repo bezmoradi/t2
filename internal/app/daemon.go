@@ -68,9 +68,8 @@ const (
 )
 
 // restartGrace is how long a wedged process waits before restarting itself,
-// in case the stream shutdown was merely slow and completes after all. A
-// variable so tests can shorten it.
-var restartGrace = 10 * time.Second
+// in case the stream shutdown was merely slow and completes after all.
+const restartGrace = 10 * time.Second
 
 type dialResult struct {
 	session *transcription.Session // set whenever a socket was opened, so it can be closed
@@ -107,21 +106,6 @@ type Daemon struct {
 	apiKey   string
 	verbose  bool
 
-	// paste delivers a transcript to the active application, and copy only
-	// puts it on the clipboard. Fields so the soak test can run the whole
-	// pipeline without typing into whatever window happens to be focused.
-	paste func(string) error
-	copy  func(string) error
-
-	// restart replaces the process after the audio layer has wedged. A field
-	// for the same reason: the soak test must not re-exec itself.
-	restart func()
-
-	// beep and dial are fields so tests can run the daemon silently and
-	// without a network.
-	beep func(string)
-	dial func(apiKey string, sampleRate int) (*transcription.Session, error)
-
 	// cur is the hold in progress. Only OnPress and OnRelease touch it, and
 	// they run one after the other on the hotkey goroutine.
 	cur *take
@@ -144,11 +128,6 @@ func NewDaemon(verbose bool) *Daemon {
 	return &Daemon{
 		sink:      newAudioSink(),
 		verbose:   verbose,
-		paste:     clipboard.PasteTextSafely,
-		copy:      clipboard.CopyText,
-		restart:   restartProcess,
-		beep:      audio.PlayBeep,
-		dial:      transcription.Dial,
 		listenEnd: make(chan struct{}),
 	}
 }
@@ -180,6 +159,12 @@ func (d *Daemon) Run() error {
 
 	fmt.Println("🎤 T2 - Voice-to-Text Daemon Started")
 	fmt.Printf("📋 Hold %s to record, release to transcribe & paste\n", hotkeys.Display)
+	if src := d.hotkeys.Source(); src != "" {
+		fmt.Printf("⌨️  Reading the keys through %s\n", src)
+	}
+	if why := clipboard.Limitation(); why != "" {
+		fmt.Printf("⚠️  %s\n", why)
+	}
 	fmt.Println("🛑 Press Ctrl+C to exit")
 	fmt.Println()
 
@@ -272,7 +257,7 @@ func (d *Daemon) OnPress() {
 		return
 	}
 
-	d.beep("start")
+	audio.PlayBeep("start")
 
 	// Capture first, connect later. The handshake costs 60-140ms of TLS plus
 	// an HTTP upgrade; if capture waited for it, every recording would lose
@@ -310,7 +295,7 @@ func (d *Daemon) OnRelease(rel hotkeys.Release) {
 
 	// The beep answers the key release, so it goes before the stop: a wedged
 	// stop takes seconds to give up, and that used to sound like no beep.
-	d.beep("stop")
+	audio.PlayBeep("stop")
 	outcome := d.recorder.Stop()
 
 	t.timer.Stop()
@@ -344,7 +329,7 @@ func (d *Daemon) startDial(t *take) {
 func (d *Daemon) connect(t *take) {
 	started := time.Now()
 
-	s, err := d.dial(d.apiKey, audio.SampleRate)
+	s, err := transcription.Dial(d.apiKey, audio.SampleRate)
 	if err != nil {
 		t.dialDone <- dialResult{err: err}
 		return
@@ -424,7 +409,7 @@ func (d *Daemon) conclude(t *take, rel hotkeys.Release, outcome audio.Outcome, d
 		// A silent room still produces chunks. None at all means the device
 		// ran no IO: the wrong input selected, or one that is gone.
 		d.discardInBackground(t, dialed)
-		fmt.Println("❌ The microphone delivered no audio - check the input device under System Settings > Sound")
+		fmt.Printf("❌ The microphone delivered no audio - check the input device in %s\n", audio.SoundSettings())
 		return
 
 	case outcome.MaxRMS < audio.SilenceThreshold:
@@ -493,51 +478,61 @@ func (d *Daemon) report(rec *recording, t transcription.Result, outcome audio.Ou
 		return
 	}
 
-	// With the hotkey physically down, a synthesised Cmd+V arrives as
-	// Ctrl+Shift+Cmd+V and does who knows what in the focused app. A capped
+	// With the hotkey physically down, a synthesised paste keystroke arrives
+	// with Ctrl+Shift added and does who knows what in the focused app. A capped
 	// hold always has the keys down, so it is copied only. Any other waits
 	// for the keys to come up - the user may already be holding them for the
 	// next dictation - which also keeps results in the order they were said.
 	if capped || !d.waitKeysUp() {
-		if err := d.copy(t.Text); err != nil {
+		if err := clipboard.CopyText(t.Text); err != nil {
 			fmt.Printf("❌ Copy failed: %v\n", err)
 		} else if capped {
-			fmt.Println("📋 Copied to the clipboard - release the keys, then press Cmd+V to paste")
+			fmt.Printf("📋 Copied to the clipboard - release the keys, then press %s to paste\n", clipboard.PasteKeys)
 		} else {
-			fmt.Println("📋 Copied to the clipboard - the keys were still held, so it was not pasted. Press Cmd+V to paste")
+			fmt.Printf("📋 Copied to the clipboard - the keys were still held, so it was not pasted. Press %s to paste\n", clipboard.PasteKeys)
 		}
 		fmt.Printf("   %s\n", t.Text)
 		return
 	}
 
-	if err := d.paste(t.Text); err != nil {
-		fmt.Printf("❌ Paste failed: %v\n", err)
-		fmt.Printf("   Transcript: %s\n", t.Text)
-		return
+	// Where the desktop takes no synthetic keystrokes the text is only
+	// copied. That is how this desktop works, not a failure, so the result
+	// is reported like a paste, in the words that fit.
+	delivered := "Pasted"
+	if err := clipboard.PasteTextSafely(t.Text); err != nil {
+		if !errors.Is(err, clipboard.ErrCopiedOnly) {
+			fmt.Printf("❌ Paste failed: %v\n", err)
+			fmt.Printf("   Transcript: %s\n", t.Text)
+			return
+		}
+		delivered = "Copied"
 	}
 
 	switch {
 	case sendErr != nil:
-		fmt.Println("⚠️  Pasted, but the connection dropped mid-recording - text may be incomplete")
+		fmt.Printf("⚠️  %s, but the connection dropped mid-recording - text may be incomplete\n", delivered)
 		fmt.Printf("   %s\n", errText(sendErr))
 		d.saveAudio(rec)
 	case !drained:
-		fmt.Println("⚠️  Pasted, but the end of the recording did not reach the server in time - text may be incomplete")
+		fmt.Printf("⚠️  %s, but the end of the recording did not reach the server in time - text may be incomplete\n", delivered)
 		d.saveAudio(rec)
 	case outcome.Err != nil:
-		fmt.Println("⚠️  Pasted, but recording stopped early - text may be incomplete")
+		fmt.Printf("⚠️  %s, but recording stopped early - text may be incomplete\n", delivered)
 		fmt.Printf("   %s\n", errText(outcome.Err))
 		d.saveAudio(rec)
 	case !t.Complete:
 		// Carries the server's close code and reason, which used to disappear
 		// into a bare "No transcription received".
-		fmt.Println("⚠️  Pasted, but the session ended abnormally - text may be incomplete")
+		fmt.Printf("⚠️  %s, but the session ended abnormally - text may be incomplete\n", delivered)
 		fmt.Printf("   %s\n", errText(t.Err))
 		d.saveAudio(rec)
 	case outcome.Overflows > 0:
-		fmt.Printf("⚠️  Pasted, but %d audio chunk(s) were dropped - text may have gaps\n", outcome.Overflows)
+		fmt.Printf("⚠️  %s, but %d audio chunk(s) were dropped - text may have gaps\n", delivered, outcome.Overflows)
 	case !t.FromFinal:
-		fmt.Println("⚠️  Pasted an unformatted draft - the server did not finish in time")
+		fmt.Printf("⚠️  %s an unformatted draft - the server did not finish in time\n", delivered)
+	case delivered == "Copied":
+		fmt.Printf("📋 Copied to the clipboard - press %s to paste\n", clipboard.PasteKeys)
+		d.removeSavedAudio()
 	default:
 		fmt.Println("✅ Pasted to active application")
 		d.removeSavedAudio()
@@ -671,7 +666,7 @@ func (d *Daemon) removeSavedAudio() {
 // press during the wait restarts at once (see OnPress).
 func (d *Daemon) scheduleRestart() {
 	grace := restartGrace
-	fmt.Printf("⚠️  The microphone did not shut down (CoreAudio hang). Restarting t2 in %v unless it recovers...\n", grace)
+	fmt.Printf("⚠️  The microphone did not shut down (%s hang). Restarting t2 in %v unless it recovers...\n", audio.Backend(), grace)
 	fmt.Println()
 
 	go func() {
@@ -695,7 +690,7 @@ func (d *Daemon) requestRestart() {
 		return
 	}
 	defer d.restarting.Store(false)
-	d.restart()
+	restartProcess()
 }
 
 // restartTimesEnv carries the times of recent automatic restarts across the
@@ -740,7 +735,7 @@ func restartProcess() {
 		return
 	}
 
-	fmt.Println("🔁 The audio layer hung inside CoreAudio. Restarting t2 automatically...")
+	fmt.Printf("🔁 The audio layer hung inside %s. Restarting t2 automatically...\n", audio.Backend())
 	fmt.Println()
 
 	exe, err := os.Executable()

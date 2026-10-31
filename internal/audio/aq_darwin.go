@@ -13,8 +13,7 @@ import (
 	"unsafe"
 )
 
-// OpenStream opens the default microphone through AudioQueue. A variable so
-// tests can substitute a fake.
+// OpenStream opens the default microphone through AudioQueue.
 //
 // This replaced PortAudio. PortAudio needed a Homebrew library, froze its
 // device list at initialisation, could not interrupt a blocking read, and its
@@ -22,13 +21,11 @@ import (
 // Recorder.Stop), which was what made t2 go deaf every few hours of heavy
 // use. AudioQueue is a system framework, follows the default microphone, and
 // installs no listeners of its own on the audio unit.
-var OpenStream = openAudioQueue
-
 type audioQueue struct {
 	s *C.t2_stream
 }
 
-func openAudioQueue(sampleRate, frames int) (Stream, error) {
+func OpenStream(sampleRate, frames int) (Stream, error) {
 	var status C.int
 	s := C.t2_stream_open(C.int(sampleRate), C.int(frames), &status)
 	if s == nil {

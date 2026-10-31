@@ -7,8 +7,7 @@ import (
 	"github.com/bezmoradi/t2/internal/audio"
 )
 
-// audioSender is what the sink streams to: a transcription.Session in the
-// daemon, a fake in tests.
+// audioSender is what the sink streams to: a transcription.Session.
 type audioSender interface {
 	Send(pcm []byte) error
 }

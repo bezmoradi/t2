@@ -1,6 +1,6 @@
 # T2 (aka Talk to Text)
 
-T2 is a CLI application written in Go that transforms your voice into text using AI transcription.
+T2 is a CLI application written in Go that transforms your voice into text using AI transcription. Hold Ctrl + Shift, speak, let go, and the text is pasted into the app you're using. It runs on macOS and Linux.
 
 ## Table of Contents
 
@@ -14,6 +14,8 @@ T2 is a CLI application written in Go that transforms your voice into text using
 
 ## Prerequisites
 
+### macOS
+
 Mac users need Go and Apple's Command Line Tools. t2 calls macOS audio and keyboard frameworks through cgo, which needs a C compiler:
 
 ```sh
@@ -22,6 +24,34 @@ $ xcode-select --install
 ```
 
 Without the Command Line Tools the install still succeeds, but t2 stops at startup with a message saying so.
+
+### Linux
+
+The Linux build needs Go and no C compiler. At run time t2 calls these tools, so install the ones for your session (`echo $XDG_SESSION_TYPE` prints `x11` or `wayland`):
+
+| What for | Tool | Debian / Ubuntu | Fedora | Arch |
+|---|---|---|---|---|
+| Recording and beeps (PulseAudio, or PipeWire with `pipewire-pulse`) | `parecord`, `pacat` | `pulseaudio-utils` | `pulseaudio-utils` | `libpulse` |
+| Clipboard on X11 | `xclip` (or `xsel`) | `xclip` | `xclip` | `xclip` |
+| Pasting on X11 | `xdotool` | `xdotool` | `xdotool` | `xdotool` |
+| Clipboard on Wayland | `wl-copy` | `wl-clipboard` | `wl-clipboard` | `wl-clipboard` |
+| Pasting on Wayland (Sway, Hyprland, COSMIC, niri and other wlroots compositors) | `wtype` | `wtype` | `wtype` | `wtype` |
+
+For example, on Ubuntu with X11:
+
+```sh
+$ sudo apt install golang pulseaudio-utils xclip xdotool
+```
+
+t2 prints a warning at startup if a clipboard or paste tool is missing.
+
+**On Wayland, t2 needs to be in the `input` group to see Ctrl + Shift.** A Wayland desktop doesn't let one program see keys typed into another, so t2 reads the key state from the kernel's input devices (`/dev/input`) instead:
+
+```sh
+$ sudo usermod -aG input $USER
+```
+
+Then log out and back in. Be aware that this lets every program you run read, and also send, every keystroke, not only t2. t2 itself only checks which keys are down, about ten times a second, and never records keystrokes. On X11 none of this is needed: t2 asks the X server, which any program can do.
 
 ### Add Go to Your PATH
 
@@ -94,6 +124,16 @@ The key is saved to `~/.config/t2/config.json`, readable by you only.
 5. **Wait**: AI processes your audio (shows progress)
 6. **Auto-paste**: Text is automatically pasted to your active application
 
+On Linux, pasting depends on the desktop:
+
+| Session | What happens |
+|---|---|
+| X11 | Pasted with Ctrl + V |
+| Wayland on Sway, Hyprland, COSMIC, niri and other wlroots compositors, with `wtype` installed | Pasted with Ctrl + V |
+| Wayland on GNOME or KDE Plasma | Copied to the clipboard; press Ctrl + V yourself. These desktops don't accept keystrokes sent by other programs |
+
+Most Linux terminals paste with Ctrl + Shift + V instead, so in a terminal the Ctrl + V that t2 sends does nothing useful. Press Ctrl + Shift + V; the text is on the clipboard. On GNOME under Wayland, `wl-copy` has to briefly open a window to reach the clipboard. If that doesn't work, t2 gives up after 3 seconds, says so, and prints the text.
+
 Good to know:
 
 -   You can start the next dictation straight away. It records from the moment you press, while the previous one is still being transcribed. Results are pasted in the order you spoke them, each once you've let go of the keys.
@@ -123,7 +163,7 @@ Clone the repository by running the following command:
 $ git clone git@github.com:bezmoradi/t2.git
 ```
 
-Then CD into the `t2` folder and build the app:
+Then CD into the `t2` folder and build the app (the same command on macOS and Linux):
 
 ```sh
 $ go build -o t2 ./cmd/t2/
@@ -148,5 +188,5 @@ No `.env` file is read.
 ## Supported Platforms
 
 -   ✅ **macOS** (fully supported)
+-   ✅ **Linux** on X11, and on Wayland with the `input` group (see [Prerequisites](#linux)). So far it has been tested in Docker containers only: X11 on Xvfb, `/dev/input` with a virtual keyboard, and PulseAudio with a virtual microphone. It hasn't yet run on a physical Linux desktop.
 -   ❌ **Windows** (planned)
--   ❌ **Linux** (planned)

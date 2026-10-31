@@ -11,8 +11,6 @@ import (
 	"time"
 )
 
-var OpenStream = openParecord
-
 // maxBuffered caps the audio held between the reader goroutine and the
 // capture loop. The loop drains it every few milliseconds, so this is only
 // reached if the loop stalls; past it the oldest audio is dropped and
@@ -40,7 +38,8 @@ type parecord struct {
 	done   chan struct{} // closed once the process has exited and been reaped
 }
 
-func openParecord(sampleRate, frames int) (Stream, error) {
+// OpenStream opens the default microphone by starting parecord.
+func OpenStream(sampleRate, frames int) (Stream, error) {
 	path, err := exec.LookPath("parecord")
 	if err != nil {
 		return nil, errors.New("audio capture needs parecord: install pulseaudio-utils (Debian, Ubuntu, Fedora) or libpulse (Arch); it works with PipeWire as well as PulseAudio")

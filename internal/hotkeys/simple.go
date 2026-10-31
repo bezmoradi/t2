@@ -46,22 +46,13 @@ type Manager struct {
 	events   chan edge
 	done     chan struct{}
 	stopOnce sync.Once
-
-	// The key-state probes and the hold limit are fields so the poller can be
-	// driven by tests without a keyboard.
-	hotkeyDown func() bool
-	otherDown  func() bool
-	maxHold    time.Duration
 }
 
 func NewManager(handler EventHandler) *Manager {
 	return &Manager{
-		handler:    handler,
-		events:     make(chan edge, eventBuffer),
-		done:       make(chan struct{}),
-		hotkeyDown: ctrlShiftDown,
-		otherDown:  otherKeyDown,
-		maxHold:    MaxHold,
+		handler: handler,
+		events:  make(chan edge, eventBuffer),
+		done:    make(chan struct{}),
 	}
 }
 
@@ -154,12 +145,12 @@ func (s *Manager) pollKeyState() {
 		}
 
 		now := time.Now()
-		isPressed := s.hotkeyDown()
+		isPressed := ctrlShiftDown()
 
 		switch {
 		case isPressed && !wasPressed:
 			// Never start a hold that already has another key down.
-			if s.otherDown() {
+			if otherKeyDown() {
 				continue
 			}
 			wasPressed = true
@@ -176,14 +167,14 @@ func (s *Manager) pollKeyState() {
 			// shortcut, not dictation. End the hold now: waiting for the keys
 			// to come up kept recording, and streaming the room to the
 			// server, for as long as they were held.
-			if s.otherDown() {
+			if otherKeyDown() {
 				ended = true
 				if !s.emit(edge{pressed: false, at: now, cancelled: true}) {
 					return
 				}
 				continue
 			}
-			if now.Sub(pressedAt) >= s.maxHold {
+			if now.Sub(pressedAt) >= MaxHold {
 				ended = true
 				if !s.emit(edge{pressed: false, at: now, capped: true}) {
 					return

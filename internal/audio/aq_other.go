@@ -13,7 +13,7 @@ import (
 // which is what happens when no C compiler is installed. The stub exists so
 // such a build fails with one clear sentence at the first recording rather
 // than with "undefined: OpenStream" at compile time.
-var OpenStream = func(sampleRate, frames int) (Stream, error) {
+func OpenStream(sampleRate, frames int) (Stream, error) {
 	if runtime.GOOS == "darwin" {
 		return nil, errors.New("audio capture needs cgo: install the Xcode Command Line Tools (xcode-select --install) and reinstall t2")
 	}

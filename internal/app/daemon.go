@@ -68,9 +68,8 @@ const (
 )
 
 // restartGrace is how long a wedged process waits before restarting itself,
-// in case the stream shutdown was merely slow and completes after all. A
-// variable so tests can shorten it.
-var restartGrace = 10 * time.Second
+// in case the stream shutdown was merely slow and completes after all.
+const restartGrace = 10 * time.Second
 
 type dialResult struct {
 	session *transcription.Session // set whenever a socket was opened, so it can be closed
@@ -107,21 +106,6 @@ type Daemon struct {
 	apiKey   string
 	verbose  bool
 
-	// paste delivers a transcript to the active application, and copy only
-	// puts it on the clipboard. Fields so the soak test can run the whole
-	// pipeline without typing into whatever window happens to be focused.
-	paste func(string) error
-	copy  func(string) error
-
-	// restart replaces the process after the audio layer has wedged. A field
-	// for the same reason: the soak test must not re-exec itself.
-	restart func()
-
-	// beep and dial are fields so tests can run the daemon silently and
-	// without a network.
-	beep func(string)
-	dial func(apiKey string, sampleRate int) (*transcription.Session, error)
-
 	// cur is the hold in progress. Only OnPress and OnRelease touch it, and
 	// they run one after the other on the hotkey goroutine.
 	cur *take
@@ -144,11 +128,6 @@ func NewDaemon(verbose bool) *Daemon {
 	return &Daemon{
 		sink:      newAudioSink(),
 		verbose:   verbose,
-		paste:     clipboard.PasteTextSafely,
-		copy:      clipboard.CopyText,
-		restart:   restartProcess,
-		beep:      audio.PlayBeep,
-		dial:      transcription.Dial,
 		listenEnd: make(chan struct{}),
 	}
 }
@@ -278,7 +257,7 @@ func (d *Daemon) OnPress() {
 		return
 	}
 
-	d.beep("start")
+	audio.PlayBeep("start")
 
 	// Capture first, connect later. The handshake costs 60-140ms of TLS plus
 	// an HTTP upgrade; if capture waited for it, every recording would lose
@@ -316,7 +295,7 @@ func (d *Daemon) OnRelease(rel hotkeys.Release) {
 
 	// The beep answers the key release, so it goes before the stop: a wedged
 	// stop takes seconds to give up, and that used to sound like no beep.
-	d.beep("stop")
+	audio.PlayBeep("stop")
 	outcome := d.recorder.Stop()
 
 	t.timer.Stop()
@@ -350,7 +329,7 @@ func (d *Daemon) startDial(t *take) {
 func (d *Daemon) connect(t *take) {
 	started := time.Now()
 
-	s, err := d.dial(d.apiKey, audio.SampleRate)
+	s, err := transcription.Dial(d.apiKey, audio.SampleRate)
 	if err != nil {
 		t.dialDone <- dialResult{err: err}
 		return
@@ -505,7 +484,7 @@ func (d *Daemon) report(rec *recording, t transcription.Result, outcome audio.Ou
 	// for the keys to come up - the user may already be holding them for the
 	// next dictation - which also keeps results in the order they were said.
 	if capped || !d.waitKeysUp() {
-		if err := d.copy(t.Text); err != nil {
+		if err := clipboard.CopyText(t.Text); err != nil {
 			fmt.Printf("❌ Copy failed: %v\n", err)
 		} else if capped {
 			fmt.Printf("📋 Copied to the clipboard - release the keys, then press %s to paste\n", clipboard.PasteKeys)
@@ -520,7 +499,7 @@ func (d *Daemon) report(rec *recording, t transcription.Result, outcome audio.Ou
 	// copied. That is how this desktop works, not a failure, so the result
 	// is reported like a paste, in the words that fit.
 	delivered := "Pasted"
-	if err := d.paste(t.Text); err != nil {
+	if err := clipboard.PasteTextSafely(t.Text); err != nil {
 		if !errors.Is(err, clipboard.ErrCopiedOnly) {
 			fmt.Printf("❌ Paste failed: %v\n", err)
 			fmt.Printf("   Transcript: %s\n", t.Text)
@@ -711,7 +690,7 @@ func (d *Daemon) requestRestart() {
 		return
 	}
 	defer d.restarting.Store(false)
-	d.restart()
+	restartProcess()
 }
 
 // restartTimesEnv carries the times of recent automatic restarts across the

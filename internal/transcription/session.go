@@ -82,8 +82,8 @@ const (
 )
 
 // Environment overrides for tuning pause tolerance to a speaking style.
-// T2_TURN_DEFAULTS=1 leaves turn detection to the server's defaults, which is
-// how the pause test shows the before and after.
+// T2_TURN_DEFAULTS=1 leaves turn detection to the server's defaults, to
+// compare against them.
 const (
 	maxTurnSilenceEnv      = "T2_MAX_TURN_SILENCE_MS"
 	minTurnSilenceEnv      = "T2_MIN_TURN_SILENCE_MS"
@@ -130,14 +130,6 @@ func (td TurnDetection) apply(q url.Values) {
 	q.Set("max_turn_silence", strconv.Itoa(td.MaxTurnSilenceMS))
 	q.Set("min_turn_silence", strconv.Itoa(td.MinTurnSilenceMS))
 	q.Set("end_of_turn_confidence_threshold", strconv.FormatFloat(td.EndOfTurnConfidence, 'f', 2, 64))
-}
-
-func (td TurnDetection) String() string {
-	if td.ServerDefaults {
-		return "server defaults (max_turn_silence 1280ms, end_of_turn_confidence_threshold 0.4)"
-	}
-	return fmt.Sprintf("max_turn_silence %dms, min_turn_silence %dms, end_of_turn_confidence_threshold %.2f",
-		td.MaxTurnSilenceMS, td.MinTurnSilenceMS, td.EndOfTurnConfidence)
 }
 
 // ErrSessionClosed reports that the session can no longer accept audio. Callers

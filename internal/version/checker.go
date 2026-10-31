@@ -9,17 +9,14 @@ import (
 	"golang.org/x/mod/semver"
 )
 
-const VERSION_URL = "https://raw.githubusercontent.com/bezmoradi/t2/main/internal/version/version.go"
+const versionURL = "https://raw.githubusercontent.com/bezmoradi/t2/main/internal/version/version.go"
 
-// The version check runs in the background at startup. The timeout bounds
-// that goroutine on a slow or wedged network, and maxBody bounds what it
-// reads: the file it fetches is a few lines long.
-var httpClient = &http.Client{Timeout: 5 * time.Second}
+var versionCheckClient = &http.Client{Timeout: 5 * time.Second}
 
-const maxBody = 64 << 10
+const maxVersionFileBytes = 64 << 10
 
 func CheckVersion() (bool, string) {
-	res, err := httpClient.Get(VERSION_URL)
+	res, err := versionCheckClient.Get(versionURL)
 	if err != nil {
 		return true, ""
 	}
@@ -27,27 +24,20 @@ func CheckVersion() (bool, string) {
 	if res.StatusCode != http.StatusOK {
 		return true, ""
 	}
-	bytes, err := io.ReadAll(io.LimitReader(res.Body, maxBody))
+	body, err := io.ReadAll(io.LimitReader(res.Body, maxVersionFileBytes))
 	if err != nil {
 		return true, ""
 	}
 
-	newVersion := extractVersion(string(bytes))
-
-	// An unparseable body means we could not determine the remote version - a
-	// renamed file, a 404 page served as 200, or a reformatted declaration.
-	// Treat that as "no answer". Comparing against the empty string here
-	// would report every install as out of date, with a message naming no
-	// version at all.
-	if newVersion == "" {
+	remoteVersion := extractVersion(string(body))
+	remoteVersionUnknown := remoteVersion == ""
+	if remoteVersionUnknown {
 		return true, ""
 	}
 
-	// Only a strictly newer remote version is worth reporting. Comparing with
-	// != also fired when the local build was *ahead* of main, which is exactly
-	// what happens while bumping the version before pushing.
-	if semver.Compare(newVersion, VERSION) > 0 {
-		return false, newVersion
+	remoteIsNewer := semver.Compare(remoteVersion, VERSION) > 0
+	if remoteIsNewer {
+		return false, remoteVersion
 	}
 
 	return true, ""

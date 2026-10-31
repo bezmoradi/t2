@@ -1,10 +1,3 @@
-// Package transcription streams PCM audio to AssemblyAI's realtime API.
-//
-// The unit here is a Session: one key press, one WebSocket, one transcript.
-// Nothing is shared between recordings. That is deliberate - the previous
-// design reused a single client across connections, which let a late message
-// from a finished recording land in the next one and let a stale Termination
-// end the next recording before it had produced anything.
 package transcription
 
 import (
@@ -28,62 +21,22 @@ import (
 const (
 	streamURL = "wss://streaming.assemblyai.com/v3/ws"
 
-	// AssemblyAI bills the wall-clock time a WebSocket stays open - idle time at
-	// the same rate as streaming audio - so the settings below are cost
-	// decisions, not just behaviour ones.
-
-	// speechModel is pinned because the server-side default is
-	// universal-3-5-pro at $0.45/hr, three times the $0.15/hr of this model.
-	// Leaving it unset means a default change silently triples the bill.
-	speechModel = "universal-streaming-english"
-
-	// audioEncoding matches the PCM16 the recorder produces. It is also the
-	// current server default, pinned so a docs update cannot change the wire
-	// format underneath us.
+	speechModel   = "universal-streaming-english"
 	audioEncoding = "pcm_s16le"
 
-	// inactivityTimeout is the server-side backstop, in seconds. If this process
-	// dies without terminating, the session dies in 30s rather than staying open
-	// to the server's 3-hour cap and being billed for all of it.
-	inactivityTimeout = 30
+	serverInactivityTimeoutSeconds = 30
 
 	dialTimeout  = 5 * time.Second
 	writeTimeout = 5 * time.Second
 
-	// readLimit caps a single server message. Turn messages carry the
-	// transcript and per-word timings of one turn, tens of kilobytes at most;
-	// without a cap a hostile or broken server could send one large enough to
-	// exhaust memory.
-	readLimit = 1 << 20
+	maxServerMessageBytes = 1 << 20
+	maxTextBytes          = 64 << 10
 
-	// maxTextBytes bounds one turn's transcript or one server error string.
-	// A single turn can span a whole five-minute hold, so this is far above
-	// any real dictation.
-	maxTextBytes = 64 << 10
-
-	// Turn detection.
-	//
-	// The server splits speech into turns and formats each one as its own
-	// sentence, so where a turn ends is where a full stop and a capital
-	// letter go. With the API defaults - end the turn on any 1280ms pause,
-	// or on a shorter one once the model is 40% sure the speaker has
-	// finished - every thinking pause in a dictation became a full stop, and
-	// one continuous thought came out as a string of stubs: "When my voice.
-	// Is broken."
-	//
-	// t2 is push-to-talk. Releasing the key ends the last turn (Terminate
-	// finalises and formats it), so within a hold turns can be made hard to
-	// end, and the formatter then punctuates from the words rather than from
-	// the pauses. A genuinely long pause after a complete sentence still
-	// ends a turn.
-	maxTurnSilenceMS    = 5000 // a pause this long ends the turn regardless
-	minTurnSilenceMS    = 700  // no end-of-turn check before this much silence
-	endOfTurnConfidence = 0.85 // and only if the model is this sure the thought is complete
+	maxTurnSilenceMS    = 5000
+	minTurnSilenceMS    = 700
+	endOfTurnConfidence = 0.85
 )
 
-// Environment overrides for tuning pause tolerance to a speaking style.
-// T2_TURN_DEFAULTS=1 leaves turn detection to the server's defaults, to
-// compare against them.
 const (
 	maxTurnSilenceEnv      = "T2_MAX_TURN_SILENCE_MS"
 	minTurnSilenceEnv      = "T2_MIN_TURN_SILENCE_MS"
@@ -91,7 +44,6 @@ const (
 	turnDefaultsEnv        = "T2_TURN_DEFAULTS"
 )
 
-// TurnDetection is the end-of-turn configuration a session is dialled with.
 type TurnDetection struct {
 	MaxTurnSilenceMS    int
 	MinTurnSilenceMS    int
@@ -99,8 +51,6 @@ type TurnDetection struct {
 	ServerDefaults      bool
 }
 
-// CurrentTurnDetection reports the configuration Dial will use, after the
-// environment overrides.
 func CurrentTurnDetection() TurnDetection {
 	td := TurnDetection{
 		MaxTurnSilenceMS:    maxTurnSilenceMS,
@@ -132,63 +82,40 @@ func (td TurnDetection) apply(q url.Values) {
 	q.Set("end_of_turn_confidence_threshold", strconv.FormatFloat(td.EndOfTurnConfidence, 'f', 2, 64))
 }
 
-// ErrSessionClosed reports that the session can no longer accept audio. Callers
-// classify with errors.Is rather than matching error strings.
 var ErrSessionClosed = errors.New("transcription session closed")
 
-// Result is everything a finished recording produced.
 type Result struct {
-	Text string
-
-	// FromFinal is false when the last turn was never formatted, so the end
-	// of the text is an unpunctuated draft that may still have been catching
-	// up. Earlier turns may be formatted; the caller should not report plain
-	// success either way.
-	FromFinal bool
-
-	// Complete is false when the session ended abnormally, or the server
-	// never confirmed the end of the session, so Text may be truncated. Never
-	// report success to the user when this is false.
-	Complete bool
-
-	// AudioSeconds and SessionSeconds come from the server's Termination
-	// message. SessionSeconds is what you are billed for.
-	AudioSeconds   float64
-	SessionSeconds float64
-
-	// Model is the model the server actually applied, echoed in Begin.
-	Model string
-
-	Err error
+	Text              string
+	LastTurnFormatted bool
+	EndedCleanly      bool
+	AudioSeconds      float64
+	BilledSeconds     float64
+	Model             string
+	Err               error
 }
 
-// Session is one recording's connection to AssemblyAI.
 type Session struct {
 	conn *websocket.Conn
 
-	// gorilla permits one concurrent writer; every write path takes this.
 	writeMu sync.Mutex
 
-	mu       sync.Mutex
-	finals   map[int]string // formatted transcript per turn
-	partials map[int]string // latest unformatted transcript per turn
-	model    string
-	audioSec float64
-	sessSec  float64
-	readErr  error
+	mu                   sync.Mutex
+	formattedByTurn      map[int]string
+	latestDraftByTurn    map[int]string
+	model                string
+	audioSeconds         float64
+	billedSessionSeconds float64
+	firstErr             error
 
-	begun chan struct{}
-	term  chan struct{}
-	done  chan struct{}
+	begun        chan struct{}
+	terminated   chan struct{}
+	readerExited chan struct{}
 
-	beginOnce sync.Once
-	termOnce  sync.Once
-	closeOnce sync.Once
+	beginOnce      sync.Once
+	terminatedOnce sync.Once
+	closeOnce      sync.Once
 }
 
-// Dial opens a session. It returns as soon as the socket is up; use Begun to
-// wait for the server to confirm, so the caller can start capturing audio in
-// parallel with the handshake instead of behind it.
 func Dial(apiKey string, sampleRate int) (*Session, error) {
 	u, err := url.Parse(streamURL)
 	if err != nil {
@@ -200,13 +127,10 @@ func Dial(apiKey string, sampleRate int) (*Session, error) {
 	q.Set("encoding", audioEncoding)
 	q.Set("speech_model", speechModel)
 	q.Set("format_turns", "true")
-	q.Set("inactivity_timeout", strconv.Itoa(inactivityTimeout))
+	q.Set("inactivity_timeout", strconv.Itoa(serverInactivityTimeoutSeconds))
 	CurrentTurnDetection().apply(q)
 	u.RawQuery = q.Encode()
 
-	// DefaultDialer has a 45s handshake timeout and no connect timeout, so a
-	// black-holed network (waking before Wi-Fi is up) would hang a press for
-	// three quarters of a minute with no feedback.
 	dialer := &websocket.Dialer{
 		Proxy:            http.ProxyFromEnvironment,
 		HandshakeTimeout: dialTimeout,
@@ -215,21 +139,20 @@ func Dial(apiKey string, sampleRate int) (*Session, error) {
 
 	conn, resp, err := dialer.Dial(u.String(), http.Header{"Authorization": {apiKey}})
 	if err != nil {
-		// A 401 and a timeout are different problems; say which.
 		if resp != nil {
 			return nil, fmt.Errorf("connecting to AssemblyAI (HTTP %d): %w", resp.StatusCode, err)
 		}
 		return nil, fmt.Errorf("connecting to AssemblyAI: %w", err)
 	}
-	conn.SetReadLimit(readLimit)
+	conn.SetReadLimit(maxServerMessageBytes)
 
 	s := &Session{
-		conn:     conn,
-		finals:   make(map[int]string),
-		partials: make(map[int]string),
-		begun:    make(chan struct{}),
-		term:     make(chan struct{}),
-		done:     make(chan struct{}),
+		conn:              conn,
+		formattedByTurn:   make(map[int]string),
+		latestDraftByTurn: make(map[int]string),
+		begun:             make(chan struct{}),
+		terminated:        make(chan struct{}),
+		readerExited:      make(chan struct{}),
 	}
 
 	go s.read()
@@ -237,30 +160,22 @@ func Dial(apiKey string, sampleRate int) (*Session, error) {
 	return s, nil
 }
 
-// Begun is closed once the server has confirmed the session.
 func (s *Session) Begun() <-chan struct{} { return s.begun }
 
-// Done is closed once the session has ended, for whatever reason. A session
-// the server rejects right after the upgrade - a bad key, no credit, too many
-// sessions - ends here without ever beginning; Err says why.
-func (s *Session) Done() <-chan struct{} { return s.done }
+func (s *Session) Done() <-chan struct{} { return s.readerExited }
 
-// Err reports why the session ended, if it ended abnormally.
 func (s *Session) Err() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.readErr
+	return s.firstErr
 }
 
-// Send streams one chunk of PCM16 audio.
 func (s *Session) Send(pcm []byte) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
-	select {
-	case <-s.done:
+	if isClosed(s.readerExited) {
 		return ErrSessionClosed
-	default:
 	}
 
 	s.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
@@ -271,71 +186,51 @@ func (s *Session) Send(pcm []byte) error {
 	return nil
 }
 
-// Finish terminates the session, waits up to wait for the server to flush its
-// final transcripts, closes the socket, and returns what the recording
-// produced. The session is dead afterwards.
-//
-// The wait matters: the server finalises the open turn on Terminate, so
-// returning early costs formatting on the last turn. The socket is closed
-// either way - an un-closed session is billed until the server's 3-hour cap.
 func (s *Session) Finish(wait time.Duration) Result {
 	termErr := s.sendTerminate()
 
 	if termErr == nil {
 		select {
-		case <-s.term:
-		case <-s.done:
+		case <-s.terminated:
+		case <-s.readerExited:
 		case <-time.After(wait):
 		}
 
-		// Termination is the server saying it has finalised every turn. Without
-		// it the last turn may be missing words, so the result is not complete
-		// - this used to be reported as a clean success.
-		select {
-		case <-s.term:
-		default:
+		if !isClosed(s.terminated) {
 			termErr = fmt.Errorf("the server did not confirm the end of the session within %v", wait)
 		}
 	}
 
 	s.Close()
 
-	// The reader owns finals/partials while it runs. Waiting for it to exit
-	// makes the state below final without any further locking dance.
-	<-s.done
+	<-s.readerExited
 
-	text, fromFinal := s.transcript()
+	text, lastTurnFormatted := s.transcript()
 
 	s.mu.Lock()
 	res := Result{
-		Text:           text,
-		FromFinal:      fromFinal,
-		AudioSeconds:   s.audioSec,
-		SessionSeconds: s.sessSec,
-		Model:          s.model,
-		Err:            s.readErr,
+		Text:              text,
+		LastTurnFormatted: lastTurnFormatted,
+		AudioSeconds:      s.audioSeconds,
+		BilledSeconds:     s.billedSessionSeconds,
+		Model:             s.model,
+		Err:               s.firstErr,
 	}
 	s.mu.Unlock()
 
 	if res.Err == nil {
 		res.Err = termErr
 	}
-	res.Complete = res.Err == nil
+	res.EndedCleanly = res.Err == nil
 
 	return res
 }
 
-// Discard terminates and closes the session without waiting for transcripts.
-// Used on the skip paths, where the recording is being thrown away but the
-// session still has to be closed: an un-terminated one stays open and billed
-// until the server's 3-hour cap.
 func (s *Session) Discard() {
 	s.sendTerminate()
 	s.Close()
 }
 
-// Close shuts the socket down. Safe to call more than once, and safe to call
-// without Finish; Finish and Discard both end with it.
 func (s *Session) Close() {
 	s.closeOnce.Do(func() {
 		s.writeMu.Lock()
@@ -365,66 +260,47 @@ func (s *Session) sendTerminate() error {
 	return nil
 }
 
-// transcript composes the recording from the best text available for each turn:
-// the formatted final where the server sent one, the latest partial otherwise,
-// joined in turn order. The bool reports whether the last turn is formatted:
-// an earlier formatted turn says nothing about whether the end of the
-// recording is.
-//
-// Partials and finals are kept apart on purpose. They used to share one field,
-// so a partial for a new turn - or a hallucinated "you" from trailing noise -
-// overwrote the entire accumulated transcript, and earlier sentences vanished.
-func (s *Session) transcript() (string, bool) {
+func (s *Session) transcript() (text string, lastTurnFormatted bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	seen := make(map[int]bool, len(s.finals)+len(s.partials))
-	orders := make([]int, 0, len(s.finals)+len(s.partials))
-	for turn := range s.finals {
+	seen := make(map[int]bool, len(s.formattedByTurn)+len(s.latestDraftByTurn))
+	turns := make([]int, 0, len(s.formattedByTurn)+len(s.latestDraftByTurn))
+	for turn := range s.formattedByTurn {
 		if !seen[turn] {
 			seen[turn] = true
-			orders = append(orders, turn)
+			turns = append(turns, turn)
 		}
 	}
-	for turn := range s.partials {
+	for turn := range s.latestDraftByTurn {
 		if !seen[turn] {
 			seen[turn] = true
-			orders = append(orders, turn)
+			turns = append(turns, turn)
 		}
 	}
-	sort.Ints(orders)
+	sort.Ints(turns)
 
-	parts := make([]string, 0, len(orders))
-	lastFinal := false
-	for _, turn := range orders {
-		text, ok := s.finals[turn]
-		if !ok {
-			text = s.partials[turn]
+	parts := make([]string, 0, len(turns))
+	for _, turn := range turns {
+		best, formatted := s.formattedByTurn[turn]
+		if !formatted {
+			best = s.latestDraftByTurn[turn]
 		}
-		parts = append(parts, text)
-		lastFinal = ok
+		parts = append(parts, best)
+		lastTurnFormatted = formatted
 	}
 
-	return strings.Join(parts, " "), lastFinal
+	return strings.Join(parts, " "), lastTurnFormatted
 }
 
 func (s *Session) read() {
-	defer close(s.done)
+	defer close(s.readerExited)
 
 	for {
 		_, data, err := s.conn.ReadMessage()
 		if err != nil {
-			// Keep the first error. The server sends an Error frame with the
-			// reason and then closes with a bare policy-violation code; the
-			// close used to overwrite the reason, so the user saw "close 1008
-			// (policy violation): See Error message for details" and never
-			// the message it referred to.
 			if !isExpectedClose(err) {
-				s.mu.Lock()
-				if s.readErr == nil {
-					s.readErr = err
-				}
-				s.mu.Unlock()
+				s.keepFirstError(err)
 			}
 			return
 		}
@@ -433,9 +309,14 @@ func (s *Session) read() {
 	}
 }
 
-// serverMessage is the subset of the streaming protocol this tool relies on.
-// Decoding into a typed struct rather than map[string]any documents those
-// fields and surfaces schema drift instead of silently reading zero values.
+func (s *Session) keepFirstError(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.firstErr == nil {
+		s.firstErr = err
+	}
+}
+
 type serverMessage struct {
 	Type       string `json:"type"`
 	Transcript string `json:"transcript"`
@@ -466,60 +347,44 @@ func (s *Session) handle(data []byte) {
 		s.beginOnce.Do(func() { close(s.begun) })
 
 	case "Turn":
-		// Cleaned on arrival, because this text is both printed to the
-		// terminal and pasted into whatever application is focused.
 		text := Sanitize(msg.Transcript)
 		if text == "" {
 			return
 		}
 		s.mu.Lock()
 		if msg.Formatted {
-			s.finals[msg.TurnOrder] = text
+			s.formattedByTurn[msg.TurnOrder] = text
 		} else {
-			s.partials[msg.TurnOrder] = text
+			s.latestDraftByTurn[msg.TurnOrder] = text
 		}
 		s.mu.Unlock()
 
 	case "Termination":
 		s.mu.Lock()
-		s.audioSec = msg.AudioSeconds
-		s.sessSec = msg.SessionSeconds
+		s.audioSeconds = msg.AudioSeconds
+		s.billedSessionSeconds = msg.SessionSeconds
 		s.mu.Unlock()
-		s.termOnce.Do(func() { close(s.term) })
+		s.terminatedOnce.Do(func() { close(s.terminated) })
 
 	case "Error":
-		s.mu.Lock()
-		if s.readErr == nil && msg.Error != "" {
-			s.readErr = fmt.Errorf("server error: %s", Sanitize(msg.Error))
+		if msg.Error != "" {
+			s.keepFirstError(fmt.Errorf("server error: %s", Sanitize(msg.Error)))
 		}
-		s.mu.Unlock()
 	}
 }
 
-// Sanitize makes text that came from the server safe to print to a terminal
-// and to paste into an application.
-//
-// Transcripts, error messages and close reasons arrive as arbitrary strings.
-// Printed raw, an escape sequence in one could move the cursor and rewrite
-// what the terminal shows was pasted, or set the terminal's clipboard; pasted
-// raw, a newline acts as Enter. Tabs and line breaks become spaces, so words
-// either side stay apart. Other control characters, and the bidirectional
-// overrides and isolates that reorder how text is displayed, are dropped.
-// Letters, accents, joiners and the left-to-right and right-to-left marks
-// that real text uses are kept.
 func Sanitize(text string) string {
 	var b strings.Builder
 	b.Grow(min(len(text), maxTextBytes))
 	for _, r := range text {
 		switch {
-		case r == '\t' || r == '\n' || r == '\r':
+		case isTabOrLineBreak(r):
 			r = ' '
-		case r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f):
-			continue
-		case (r >= 0x202a && r <= 0x202e) || (r >= 0x2066 && r <= 0x2069):
+		case isControlCharacter(r), isBidiOverrideOrIsolate(r):
 			continue
 		}
-		if b.Len()+utf8.RuneLen(r) > maxTextBytes {
+		wouldExceedCap := b.Len()+utf8.RuneLen(r) > maxTextBytes
+		if wouldExceedCap {
 			break
 		}
 		b.WriteRune(r)
@@ -527,10 +392,23 @@ func Sanitize(text string) string {
 	return b.String()
 }
 
-// isExpectedClose reports whether an error is the ordinary end of a session
-// rather than something worth telling the user about. Anything else - including
-// a close code like 3007 (chunk duration) or 3008 (session limit) - is kept and
-// surfaced, since those used to vanish into a bare "No transcription received".
+func isTabOrLineBreak(r rune) bool { return r == '\t' || r == '\n' || r == '\r' }
+
+func isControlCharacter(r rune) bool { return r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f) }
+
+func isBidiOverrideOrIsolate(r rune) bool {
+	return (r >= 0x202a && r <= 0x202e) || (r >= 0x2066 && r <= 0x2069)
+}
+
+func isClosed(ch <-chan struct{}) bool {
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
+	}
+}
+
 func isExpectedClose(err error) bool {
 	if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
 		return true

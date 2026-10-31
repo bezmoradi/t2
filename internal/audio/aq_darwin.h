@@ -1,6 +1,5 @@
 #include <stdint.h>
 
-/* t2_stream_open status when memory for the stream could not be allocated. */
 #define T2_ERR_NOMEM (-108)
 
 typedef struct t2_stream t2_stream;

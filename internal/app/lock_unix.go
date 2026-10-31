@@ -12,24 +12,19 @@ import (
 	"github.com/bezmoradi/t2/internal/config"
 )
 
-// errAlreadyRunning means another t2 daemon holds the instance lock.
+const instanceLockName = "t2.lock"
+
 var errAlreadyRunning = errors.New("t2 is already running, in another terminal or tab - two would both transcribe and paste every dictation")
 
-// LockInstance makes sure only one t2 daemon runs per user. The returned file
-// holds the lock for as long as it stays open; keep it until exit.
-//
-// The lock is an flock on ~/.config/t2/t2.lock. Go opens files close-on-exec,
-// so the automatic restart releases it at exec and the new image takes it
-// again.
-func LockInstance() (*os.File, error) {
+func LockInstance() (heldUntilClosed *os.File, err error) {
 	dir, err := config.EnsureConfigDir()
 	if err != nil {
 		return nil, err
 	}
-	return lockFile(filepath.Join(dir, "t2.lock"))
+	return flockCloseOnExec(filepath.Join(dir, instanceLockName))
 }
 
-func lockFile(path string) (*os.File, error) {
+func flockCloseOnExec(path string) (*os.File, error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, err

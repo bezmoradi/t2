@@ -7,7 +7,6 @@ import (
 	"runtime"
 )
 
-// PasteKeys is the keystroke that pastes, as the user is told to press it.
 const PasteKeys = "Ctrl+V"
 
 func Limitation() string {
@@ -16,4 +15,4 @@ func Limitation() string {
 
 func CopyText(text string) error { return fmt.Errorf("failed to copy to clipboard: %s", Limitation()) }
 
-func PasteTextSafely(text string) error { return CopyText(text) }
+func PasteOnce(text string) error { return CopyText(text) }

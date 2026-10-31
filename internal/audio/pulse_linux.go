@@ -1,6 +1,7 @@
 package audio
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -38,11 +39,13 @@ type parecord struct {
 	done   chan struct{} // closed once the process has exited and been reaped
 }
 
+const noParecord = "audio capture needs parecord: install pulseaudio-utils (Debian, Ubuntu, Fedora) or libpulse (Arch); it works with PipeWire as well as PulseAudio"
+
 // OpenStream opens the default microphone by starting parecord.
 func OpenStream(sampleRate, frames int) (Stream, error) {
 	path, err := exec.LookPath("parecord")
 	if err != nil {
-		return nil, errors.New("audio capture needs parecord: install pulseaudio-utils (Debian, Ubuntu, Fedora) or libpulse (Arch); it works with PipeWire as well as PulseAudio")
+		return nil, errors.New(noParecord)
 	}
 
 	latency := max(frames*1000/sampleRate, 10)
@@ -67,6 +70,73 @@ func OpenStream(sampleRate, frames int) (Stream, error) {
 	}
 	go p.pump(out)
 	return p, nil
+}
+
+// Limitation reports, for the startup banner, why recording will not work,
+// or "" when nothing is wrong that can be seen before the first hold.
+//
+// Without it, a missing microphone surfaced only once someone had held the
+// keys and spoken. Worse, on a machine with no microphone the default source
+// is usually the monitor of an output, which parecord records from happily:
+// the dictation came back as whatever the machine was playing - on an idle
+// one, silence, reported as "No speech detected".
+func Limitation() string {
+	if _, err := exec.LookPath("parecord"); err != nil {
+		return noParecord
+	}
+	if _, err := exec.LookPath("pactl"); err != nil {
+		return "" // ships with parecord; without it there is nothing to ask
+	}
+
+	out, err := pactl("list", "short", "sources")
+	if err != nil {
+		return fmt.Sprintf("cannot reach the sound server, so t2 cannot record (pactl: %v)", err)
+	}
+	var mics, monitors []string
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		if len(f) < 2 {
+			continue
+		}
+		if strings.HasSuffix(f[1], ".monitor") {
+			monitors = append(monitors, f[1])
+		} else {
+			mics = append(mics, f[1])
+		}
+	}
+	if len(mics) == 0 {
+		return fmt.Sprintf("no microphone found: the sound server has only monitors of outputs (%s), which record what the computer plays, not your voice. Connect a microphone", strings.Join(monitors, ", "))
+	}
+
+	// parecord records from the default source. Older servers have no
+	// get-default-source; then this check is skipped.
+	if def, err := pactl("get-default-source"); err == nil && strings.HasSuffix(def, ".monitor") {
+		return fmt.Sprintf("the default input is %s, a monitor of an output, which records what the computer plays, not your voice: choose a microphone in %s", def, SoundSettings())
+	}
+	return ""
+}
+
+// pactl runs one pactl query, bounded so a wedged sound server cannot hold
+// up startup.
+func pactl(args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "pactl", args...).Output()
+	if ctx.Err() != nil {
+		return "", errors.New("no answer within 2s")
+	}
+	if err != nil {
+		// pactl explains itself on stderr ("Connection failure: ...");
+		// the exit status alone says nothing.
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			if msg := strings.TrimSpace(string(ee.Stderr)); msg != "" {
+				return "", errors.New(strings.SplitN(msg, "\n", 2)[0])
+			}
+		}
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
 }
 
 // pump moves audio from the process into buf until the process ends.

@@ -73,6 +73,7 @@ Files are split by build constraint. `*_darwin.go` (cgo where needed) and `*_lin
   - any other key cancels it at once;
   - a hold is capped at `MaxHold` (5 minutes).
 - After a cancel or the cap, the keys are ignored until they physically come up, so a stuck modifier can't keep the microphone open.
+- The `/dev/input` path starts even with no keyboard, unless a device was refused for lack of permission (then it stops with the `input` group message). The 3 s rescan picks up a keyboard plugged in later. Refused devices are retried on every rescan, because a node is briefly root's before udev hands it to the `input` group.
 - On Wayland, no program can see keys typed into another program's window, X11 programs under XWayland included. That's why Wayland uses `/dev/input`, which needs the `input` group. The GlobalShortcuts portal was rejected for two reasons: a trigger can't be modifier-only, and it can't report the cancel.
 
 **Clipboard (`internal/clipboard`).**
@@ -84,6 +85,8 @@ Files are split by build constraint. `*_darwin.go` (cgo where needed) and `*_lin
 - Turn detection tolerates thinking pauses (`max_turn_silence` 5000 ms, `min_turn_silence` 700 ms, `end_of_turn_confidence_threshold` 0.85), so a dictation isn't split into one capitalised sentence per pause. The key release ends the last turn anyway.
 - These can be tuned with `T2_MAX_TURN_SILENCE_MS`, `T2_MIN_TURN_SILENCE_MS` and `T2_END_OF_TURN_CONFIDENCE`. `T2_TURN_DEFAULTS=1` uses the server's defaults.
 - The Begin message doesn't carry the speech model, so the model shown by `-v` is blank.
+
+**Startup checks.** `Daemon.Run` collects `audio.Limitation()` and `clipboard.Limitation()` before starting the hotkey, and prints them even when that start fails, so a machine missing several things learns all of them in one run. On Linux, `audio.Limitation` asks `pactl` for the sources and warns when there is no microphone (only `.monitor` sources), when the default source is a monitor, or when the sound server can't be reached. `parecord` records a monitor without complaint, so without this check a machine with no microphone recorded what it was playing.
 
 **Diagnostics.** `T2_FRAMES_PER_BUFFER=32 t2` runs with 32-frame capture buffers (default 1024, allowed 32–8192). That was the setting that made the PortAudio deadlock reproducible.
 

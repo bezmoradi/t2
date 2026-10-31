@@ -71,12 +71,18 @@ func openEvdev() (*evdevKeyboard, error) {
 			"   Run: sudo usermod -aG input $USER, then log out and back in.\n" +
 			"   Note that every program you run can then read the keyboard, not only t2")
 	}
-	return nil, errors.New("no keyboard found under /dev/input")
+	// Nothing refused, just no keyboard yet: a headless machine that gets
+	// one plugged in later. Exiting here made the rescan that exists for
+	// exactly that case unreachable, so start and let it find one.
+	return k, nil
 }
 
 func (k *evdevKeyboard) source() string {
 	k.mu.Lock()
 	defer k.mu.Unlock()
+	if len(k.devices) == 0 {
+		return fmt.Sprintf("/dev/input, but no keyboard is connected yet: one plugged in is picked up within %v", rescanInterval)
+	}
 	return fmt.Sprintf("/dev/input (%d keyboard device(s))", len(k.devices))
 }
 
@@ -109,7 +115,11 @@ func (k *evdevKeyboard) scan() (denied int) {
 		f, err := os.OpenFile(p, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 		if err != nil {
 			if errors.Is(err, fs.ErrPermission) {
+				// Not skipped: a device just plugged in is root's until
+				// udev gives it to the input group, and a rescan landing
+				// in that moment must not rule the keyboard out for good.
 				denied++
+				continue
 			}
 			k.skip[p] = ino
 			continue

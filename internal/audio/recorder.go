@@ -52,7 +52,7 @@ var (
 
 // ErrWedged reports that a previous recording's stream never shut down, so
 // this process's audio layer is unusable until the process restarts.
-var ErrWedged = errors.New("the audio layer is stuck inside CoreAudio; t2 has to restart")
+var ErrWedged = errors.New("the audio layer is stuck inside " + Backend() + "; t2 has to restart")
 
 // Stream is one open capture from the default microphone: mono int16 at
 // SampleRate. OpenStream provides the platform's implementation.

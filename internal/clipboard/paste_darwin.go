@@ -7,6 +7,13 @@ import (
 	"time"
 )
 
+// PasteKeys is the keystroke that pastes, as the user is told to press it.
+const PasteKeys = "Cmd+V"
+
+// Limitation reports why transcripts will only be copied, not pasted; on
+// macOS that never applies.
+func Limitation() string { return "" }
+
 // CopyText puts text on the clipboard without pasting it.
 func CopyText(text string) error {
 	if text == "" {

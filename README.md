@@ -35,7 +35,7 @@ The Linux build needs Go and no C compiler. At run time t2 calls these tools, so
 | Clipboard on X11 | `xclip` (or `xsel`) | `xclip` | `xclip` | `xclip` |
 | Pasting on X11 | `xdotool` | `xdotool` | `xdotool` | `xdotool` |
 | Clipboard on Wayland | `wl-copy` | `wl-clipboard` | `wl-clipboard` | `wl-clipboard` |
-| Pasting on Wayland (Sway, Hyprland, COSMIC, niri and other wlroots compositors) | `wtype` | `wtype` | `wtype` | `wtype` |
+| Typing on Wayland (labwc, Sway, Hyprland, COSMIC, niri and other compositors with the virtual-keyboard protocol) | `wtype` | `wtype` | `wtype` | `wtype` |
 
 For example, on Ubuntu with X11:
 
@@ -129,10 +129,14 @@ On Linux, pasting depends on the desktop:
 | Session | What happens |
 |---|---|
 | X11 | Pasted with Ctrl + V |
-| Wayland on Sway, Hyprland, COSMIC, niri and other wlroots compositors, with `wtype` installed | Pasted with Ctrl + V |
+| Wayland on labwc, Sway, Hyprland, COSMIC, niri and other compositors with the virtual-keyboard protocol, with `wtype` installed | Typed into the app, as if from a keyboard, and also copied to the clipboard |
 | Wayland on GNOME or KDE Plasma | Copied to the clipboard; press Ctrl + V yourself. These desktops don't accept keystrokes sent by other programs |
 
-Most Linux terminals paste with Ctrl + Shift + V instead, so in a terminal the Ctrl + V that t2 sends does nothing useful. Press Ctrl + Shift + V; the text is on the clipboard. On GNOME under Wayland, `wl-copy` has to briefly open a window to reach the clipboard. If that doesn't work, t2 gives up after 3 seconds, says so, and prints the text.
+On Wayland, t2 types the text instead of pressing Ctrl + V, because GTK3 apps, such as Mousepad, ignore shortcuts sent by `wtype`. Typing takes a moment: about 4 seconds per 1,000 characters on a Raspberry Pi 5. Wait for it to finish before you type, or your keys land in the middle of it.
+
+On X11, most terminals paste with Ctrl + Shift + V instead, so in a terminal the Ctrl + V that t2 sends does nothing useful. Press Ctrl + Shift + V; the text is on the clipboard.
+
+On GNOME under Wayland, `wl-copy` has to briefly open a window to reach the clipboard. If that doesn't work, t2 gives up after 3 seconds, says so, and prints the text.
 
 Good to know:
 

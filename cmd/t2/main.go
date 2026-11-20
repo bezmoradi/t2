@@ -6,9 +6,12 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/bezmoradi/t2/internal/app"
 	"github.com/bezmoradi/t2/internal/config"
+	"github.com/bezmoradi/t2/internal/transcription"
 	"github.com/bezmoradi/t2/internal/version"
 )
 
@@ -60,7 +63,26 @@ func notifyIfOutdated() {
 	}
 
 	fmt.Printf("\n💡 T2 %s is available (you have %s). %s\n", newVersion, version.VERSION, version.UpdateMessage)
-	fmt.Printf("   go install github.com/bezmoradi/t2/cmd/t2@%s\n\n", newVersion)
+	fmt.Printf("   curl -fsSL %s | %ssh\n", installScriptURL, installDirPrefix())
+	fmt.Printf("   or, with Go: go install github.com/bezmoradi/t2/cmd/t2@%s\n\n", newVersion)
+}
+
+const installScriptURL = "https://github.com/bezmoradi/t2/releases/latest/download/install.sh"
+
+func installDirPrefix() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	exe, err = filepath.EvalSymlinks(exe)
+	if err != nil {
+		return ""
+	}
+	dir := filepath.Dir(exe)
+	if !filepath.IsAbs(dir) || transcription.Sanitize(dir) != dir {
+		return ""
+	}
+	return "T2_INSTALL_DIR='" + strings.ReplaceAll(dir, "'", `'\''`) + "' "
 }
 
 func handleShowConfig() {

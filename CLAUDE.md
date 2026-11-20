@@ -10,6 +10,7 @@ T2 (Talk to Text) is a Go CLI daemon: hold Ctrl+Shift to record, release to have
 go build -o t2 ./cmd/t2          # build
 go run -race ./cmd/t2 -v         # run from source; -v prints timings, chunks, billed seconds
 go install github.com/bezmoradi/t2/cmd/t2@main
+scripts/release.sh 1.3.1 /tmp/t2-dist   # local release, clean checkout on macOS: four archives, install.sh, SHA256SUMS
 
 # Checks to run before any commit: every platform must vet and build
 go vet ./... && GOOS=linux CGO_ENABLED=0 go vet ./... && GOOS=windows go vet ./...
@@ -32,12 +33,12 @@ Linux can be run end to end in Docker (`golang:1.27-bookworm`):
 
 ## Constraints
 
-- **No comments in the code, ever.** That covers Go, C and the workflow files: no doc comments, no inline comments, no commented-out code. A comment drifts from the code it describes, so the code is the only source of truth. Make names, named constants, types and small functions say what a comment would have said. The only exceptions are directives the toolchain reads: `//go:build`, `//export`, and the `#cgo` and `#include` lines of a cgo preamble. C code goes in `.c` and `.h` files (`aq_darwin.c`, `keys_darwin.c`), never in the preamble. A constraint the code can't express goes in this file, not in a comment.
+- **No comments in the code, ever.** That covers Go, C, the shell scripts and the workflow files: no doc comments, no inline comments, no commented-out code, and no version comment after a pinned action's SHA. A comment drifts from the code it describes, so the code is the only source of truth. Make names, named constants, types and small functions say what a comment would have said. The only exceptions are directives the toolchain reads: `//go:build`, `//export`, the `#cgo` and `#include` lines of a cgo preamble, a script's `#!` line and `# shellcheck` directives. C code goes in `.c` and `.h` files (`aq_darwin.c`, `keys_darwin.c`), never in the preamble. A constraint the code can't express goes in this file, not in a comment.
 - **AssemblyAI bills the wall-clock time a session is open, idle included.** Never open a session outside a recording. The dial waits until a hold reaches 400 ms (`quickPressThreshold`), so taps and quick shortcuts never connect. Capture starts on the press and is buffered meanwhile. Every skip path closes a session that was opened. `speechModel` is pinned because the server default costs three times as much.
 - **The API key** comes from `ASSEMBLYAI_API_KEY`, then `~/.config/t2/config.json` (0600, in a 0700 directory), then a hidden prompt that saves it. No `.env` file is read: one read from the working directory once billed another project's account. Never print or log the key; `--show-config` masks it, because people paste that output when asking for help.
 - **Text from the server** (transcripts, error messages, close reasons) goes through `transcription.Sanitize` (or the daemon's `errText`) before it's printed or pasted, because it can contain terminal control characters. Server messages are capped at 1 MiB, and the update check's response body at 64 KiB.
 - **The paste keystroke, or the typing on Wayland, is sent once and never retried.** osascript and the Linux tools can report a failure after the keys were delivered, and a second paste corrupts what the user is typing. The text stays on the clipboard either way.
-- **No cgo on Linux.** `go install` there must work with no C compiler and no `-dev` packages. That's why the X11 poller uses `github.com/jezek/xgb` instead of Xlib, and why capture and beeps run `parecord` and `pacat`.
+- **No cgo on Linux.** `go install` there must work with no C compiler and no `-dev` packages, and the release's linux archives are built with `CGO_ENABLED=0`. That's why the X11 poller uses `github.com/jezek/xgb` instead of Xlib, and why capture and beeps run `parecord` and `pacat`.
 - **GitHub text:** `.github/workflows/claude.yml` reacts to mentions of the bot. Put handles in backticks in issues, PRs and comments.
 - **Toolchain:** go.mod requires go 1.27.3, for the patched crypto/tls and crypto/x509. It pins `godebug x509sslcertoverrideplatform=0` so certificate checks stay on Apple's verifier.
 
@@ -98,6 +99,14 @@ Files are split by build constraint. `*_darwin.go` (cgo where needed) and `*_lin
 **Startup checks.** `Daemon.Run` collects `audio.Limitation()` and `clipboard.Limitation()` before starting the hotkey, and prints them even when that start fails, so a machine missing several things learns all of them in one run. On Linux, `audio.Limitation` asks `pactl` for the sources and warns when there is no microphone (only `.monitor` sources), when the default source is a monitor, or when the sound server can't be reached. `parecord` records a monitor without complaint, so without this check a machine with no microphone recorded what it was playing.
 
 **Diagnostics.** `T2_FRAMES_PER_BUFFER=32 t2` runs with 32-frame capture buffers (default 1024, allowed 32–8192). That was the setting that made the PortAudio deadlock reproducible.
+
+## Releases
+
+- The version lives only in `internal/version/version.go` (`VERSION`, a constant, so not set by ldflags). The update check reads that file on main, so it announces a version as soon as main says so, and the hint's `releases/latest` installs the newest published release. `release.sh` and the release workflow refuse a tag or version that isn't `VERSION`.
+- `.github/workflows/release.yml` runs on a `v*` tag on main pushed by the owner: a linux job (ubuntu-24.04, no cgo), a darwin job (macos-26, arm64, cgo), then `assemble` writes `SHA256SUMS` and renders `install.sh` with `scripts/release-install.sh`, `attest` signs, `draft` drafts. Each job gets only the permissions it uses.
+- Both darwin archives are built on the one arm64 runner: with `GOARCH=amd64` the go command passes `-arch x86_64` to clang, and the SDK holds both architectures. That avoids depending on GitHub's Intel macOS images. The amd64 program isn't run in CI; the job checks its architecture with `lipo` and that it links AudioToolbox.
+- `MACOSX_DEPLOYMENT_TARGET=13.0` matches Go's own minimum. Without it a cgo build is marked for the runner's macOS version (`vtool -show-build` shows `minos`), and older Macs refuse it.
+- `scripts/install.sh` is a template: `release-install.sh` replaces its `@VERSION@` and `@SHA256_<OS>_<ARCH>@` lines, and the unrendered script stops. It has no test hook: to try a release locally, serve the folder on 127.0.0.1 and run a copy with the base URL changed and `--proto '=https' --tlsv1.2` dropped, installing into a fresh `T2_INSTALL_DIR`.
 
 ## Platform status
 

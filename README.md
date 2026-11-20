@@ -4,7 +4,7 @@
   <img src="https://img.shields.io/badge/Engineered-not%20vibe%20coded-blue?style=for-the-badge" alt="Engineered, not vibe coded">
 </p>
 
-## #1 Stop vibe coding <img src="https://img.shields.io/badge/Merged-8957e5?style=flat-square&logo=git&logoColor=white" alt="Merged">
+## #1 STOP VIBE CODING <img src="https://img.shields.io/badge/Merged-8957e5?style=flat-square&logo=git&logoColor=white" alt="Merged">
 
 ```diff
 - vibe coded: shipped because it compiled
@@ -19,58 +19,58 @@ T2 is a CLI application written in Go that transforms your voice into text using
 
 ## Table of Contents
 
--   [Prerequisites](#prerequisites)
 -   [Installation](#installation)
+-   [Prerequisites](#prerequisites)
 -   [Setting up AssemblyAI API Key](#setting-up-assemblyai-api-key)
 -   [Usage](#usage)
 -   [Application Commands](#application-commands)
 -   [Building from Source](#building-from-source)
 -   [Supported Platforms](#supported-platforms)
 
-## Prerequisites
+## Installation
 
-### macOS
+Install the latest release with one command, on macOS or Linux, on Intel/AMD (amd64) or ARM (arm64):
 
-Mac users need Go and Apple's Command Line Tools. t2 calls macOS audio and keyboard frameworks through cgo, which needs a C compiler:
+```sh
+$ curl -fsSL https://github.com/bezmoradi/t2/releases/latest/download/install.sh | sh
+```
+
+It needs `curl`, `tar`, and `sha256sum` or `shasum`, and no Go, no Xcode Command Line Tools and no sudo. It downloads the archive for your platform, checks it against the SHA-256 the script carries and the archive's own `SHA256SUMS`, and installs `t2` into `~/.local/bin`, or the folder in `T2_INSTALL_DIR`:
+
+```sh
+$ curl -fsSL https://github.com/bezmoradi/t2/releases/latest/download/install.sh | T2_INSTALL_DIR="$HOME/bin" sh
+```
+
+If anything fails, it stops with one line and leaves the folder as it was. On Linux it then warns about each [run-time tool](#linux) that isn't installed, with the package to install. If the folder isn't on your `PATH`, it prints the line to add to your shell's profile. Run the same command again to update; when a newer version is out, t2 prints the command at startup.
+
+To check the script before you run it, download it and verify that this repository's release workflow built it (with a signed-in [`gh`](https://cli.github.com)):
+
+```sh
+$ curl -fsSLO https://github.com/bezmoradi/t2/releases/latest/download/install.sh
+$ gh attestation verify install.sh -R bezmoradi/t2 --signer-workflow bezmoradi/t2/.github/workflows/release.yml
+$ sh install.sh
+```
+
+Then run `t2`. That's it! The app will guide you through the API key setup on first run.
+
+### With Go
+
+You can also build and install t2 with Go:
+
+```sh
+$ go install github.com/bezmoradi/t2/cmd/t2@latest
+```
+
+That needs Go, and on macOS also Apple's Command Line Tools: t2 calls macOS audio and keyboard frameworks through cgo, which needs a C compiler. The Linux build needs no C compiler.
 
 ```sh
 $ brew install go
 $ xcode-select --install
 ```
 
-Without the Command Line Tools the install still succeeds, but t2 stops at startup with a message saying so.
+On macOS without the Command Line Tools the install still succeeds, but t2 stops at startup with a message saying so.
 
-### Linux
-
-The Linux build needs Go and no C compiler. At run time t2 calls these tools, so install the ones for your session (`echo $XDG_SESSION_TYPE` prints `x11` or `wayland`):
-
-| What for | Tool | Debian / Ubuntu | Fedora | Arch |
-|---|---|---|---|---|
-| Recording and beeps (PulseAudio, or PipeWire with `pipewire-pulse`) | `parecord`, `pacat` | `pulseaudio-utils` | `pulseaudio-utils` | `libpulse` |
-| Clipboard on X11 | `xclip` (or `xsel`) | `xclip` | `xclip` | `xclip` |
-| Pasting on X11 | `xdotool` | `xdotool` | `xdotool` | `xdotool` |
-| Clipboard on Wayland | `wl-copy` | `wl-clipboard` | `wl-clipboard` | `wl-clipboard` |
-| Typing on Wayland (labwc, Sway, Hyprland, COSMIC, niri and other compositors with the virtual-keyboard protocol) | `wtype` | `wtype` | `wtype` | `wtype` |
-
-For example, on Ubuntu with X11:
-
-```sh
-$ sudo apt install golang pulseaudio-utils xclip xdotool
-```
-
-t2 prints a warning at startup if a clipboard or paste tool is missing, or if the sound server has no microphone.
-
-**On Wayland, t2 needs to be in the `input` group to see Ctrl + Shift.** A Wayland desktop doesn't let one program see keys typed into another, so t2 reads the key state from the kernel's input devices (`/dev/input`) instead:
-
-```sh
-$ sudo usermod -aG input $USER
-```
-
-Then log out and back in. Be aware that this lets every program you run read, and also send, every keystroke, not only t2. t2 itself only checks which keys are down, about ten times a second, and never records keystrokes. On X11 none of this is needed: t2 asks the X server, which any program can do. If no keyboard is connected when t2 starts, it waits and uses one as soon as it's plugged in. It only sees keyboards attached to the machine: keys typed over SSH, or through screen sharing, usually don't reach `/dev/input`.
-
-### Add Go to Your PATH
-
-You need to make sure Go's binaries are available in your `PATH`. Add the following line to your shell configuration file:
+`go install` puts `t2` in Go's `bin` folder, so make sure Go's binaries are available in your `PATH`. Add the following line to your shell configuration file:
 
 ```sh
 export PATH=$PATH:$HOME/go/bin
@@ -98,21 +98,39 @@ $ echo $SHELL
 
 That will tell you whether you’re in `zsh`, `bash`, or another shell. Update the correct configuration file accordingly.
 
-## Installation
+## Prerequisites
 
-To install the tool, run the following command inside terminal:
+### macOS
+
+The release builds run on macOS 13 Ventura or later and need nothing else installed.
+
+### Linux
+
+At run time t2 calls these tools, so install the ones for your session (`echo $XDG_SESSION_TYPE` prints `x11` or `wayland`):
+
+| What for | Tool | Debian / Ubuntu | Fedora | Arch |
+|---|---|---|---|---|
+| Recording and beeps (PulseAudio, or PipeWire with `pipewire-pulse`) | `parecord`, `pacat` | `pulseaudio-utils` | `pulseaudio-utils` | `libpulse` |
+| Clipboard on X11 | `xclip` (or `xsel`) | `xclip` | `xclip` | `xclip` |
+| Pasting on X11 | `xdotool` | `xdotool` | `xdotool` | `xdotool` |
+| Clipboard on Wayland | `wl-copy` | `wl-clipboard` | `wl-clipboard` | `wl-clipboard` |
+| Typing on Wayland (labwc, Sway, Hyprland, COSMIC, niri and other compositors with the virtual-keyboard protocol) | `wtype` | `wtype` | `wtype` | `wtype` |
+
+For example, on Ubuntu with X11:
 
 ```sh
-$ go install github.com/bezmoradi/t2/cmd/t2@latest
+$ sudo apt install pulseaudio-utils xclip xdotool
 ```
 
-To make sure it's installed correctly in your `$GOPATH`, run the following command:
+t2 prints a warning at startup if a clipboard or paste tool is missing, or if the sound server has no microphone.
+
+**On Wayland, t2 needs to be in the `input` group to see Ctrl + Shift.** A Wayland desktop doesn't let one program see keys typed into another, so t2 reads the key state from the kernel's input devices (`/dev/input`) instead:
 
 ```sh
-$ t2
+$ sudo usermod -aG input $USER
 ```
 
-If the installation process goes well, from now on you can run the `t2` command from anywhere on your file system. That's it! The app will guide you through the API key setup on first run.
+Then log out and back in. Be aware that this lets every program you run read, and also send, every keystroke, not only t2. t2 itself only checks which keys are down, about ten times a second, and never records keystrokes. On X11 none of this is needed: t2 asks the X server, which any program can do. If no keyboard is connected when t2 starts, it waits and uses one as soon as it's plugged in. It only sees keyboards attached to the machine: keys typed over SSH, or through screen sharing, usually don't reach `/dev/input`.
 
 ## Setting up AssemblyAI API Key
 
@@ -182,7 +200,7 @@ Clone the repository by running the following command:
 $ git clone git@github.com:bezmoradi/t2.git
 ```
 
-Then CD into the `t2` folder and build the app (the same command on macOS and Linux):
+Then CD into the `t2` folder and build the app (the same command on macOS and Linux; it needs what [With Go](#with-go) lists):
 
 ```sh
 $ go build -o t2 ./cmd/t2/
@@ -193,6 +211,8 @@ Finally, run the app by the following command:
 ```sh
 $ ./t2
 ```
+
+To build a release locally into `dist`, from a clean checkout on macOS (the darwin builds need cgo; linux builds without it anywhere), run `scripts/release.sh <version>`, with the version `internal/version/version.go` sets, without its `v`. It writes the four archives, `install.sh` and `SHA256SUMS`. A `v*` tag on main that matches that version makes `.github/workflows/release.yml` build, check, sign and draft the release; the owner publishes it.
 
 ### API Key Priority System
 

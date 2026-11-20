@@ -1,3 +1,18 @@
+<h1 align="center">⚙️ Engineered, Not Vibe Coded</h1>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Engineered-not%20vibe%20coded-blue?style=for-the-badge" alt="Engineered, not vibe coded">
+</p>
+
+## #1 Stop vibe coding <img src="https://img.shields.io/badge/Merged-8957e5?style=flat-square&logo=git&logoColor=white" alt="Merged">
+
+```diff
+- vibe coded: shipped because it compiled
++ engineered: designed, reviewed, documented
+```
+
+<sub>✅ Approved by human reviewers · All checks passed</sub>
+
 # T2 (aka Talk to Text)
 
 T2 is a CLI application written in Go that transforms your voice into text using AI transcription. Hold Ctrl + Shift, speak, let go, and the text is pasted into the app you're using. It runs on macOS and Linux.

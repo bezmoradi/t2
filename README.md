@@ -20,28 +20,53 @@ T2 is a CLI application written in Go that transforms your voice into text using
 ## Table of Contents
 
 -   [Installation](#installation)
+    -   [Install somewhere else](#install-somewhere-else)
+    -   [Update](#update)
+    -   [Check the script first](#check-the-script-first)
+    -   [Other ways to install](#other-ways-to-install)
 -   [Prerequisites](#prerequisites)
 -   [Setting up AssemblyAI API Key](#setting-up-assemblyai-api-key)
 -   [Usage](#usage)
 -   [Application Commands](#application-commands)
 -   [Building from Source](#building-from-source)
+    -   [Releasing](#releasing)
 -   [Supported Platforms](#supported-platforms)
 
 ## Installation
 
-Install the latest release with one command, on macOS or Linux, on Intel/AMD (amd64) or ARM (arm64):
+Install the latest release with one command, on Linux or macOS, on Intel/AMD (amd64) or ARM (arm64):
 
 ```sh
 $ curl -fsSL https://github.com/bezmoradi/t2/releases/latest/download/install.sh | sh
 ```
 
-It needs `curl`, `tar`, and `sha256sum` or `shasum`, and no Go, no Xcode Command Line Tools and no sudo. It downloads the archive for your platform, checks it against the SHA-256 the script carries and the archive's own `SHA256SUMS`, and installs `t2` into `~/.local/bin`, or the folder in `T2_INSTALL_DIR`:
+The script:
+
+-   runs on linux and darwin, amd64 and arm64, and stops with one line on anything else, or when `curl`, `tar`, or `sha256sum` or `shasum` is missing; it needs no Go and no Xcode Command Line Tools;
+-   downloads the release's archive for your platform, checks it against the SHA-256 written into the script and against the archive's own `SHA256SUMS`, and checks that its `t2 --version` prints the release's version;
+-   installs `t2` into `~/.local/bin`, without sudo, and prints the line to add to your shell's profile if that folder isn't on your `PATH`;
+-   on Linux, then warns about each [run-time tool](#linux) that isn't installed, with the package to install;
+-   stops with one line if anything fails, and leaves the folder as it was.
+
+`latest` is the newest published release that isn't a prerelease; `releases/download/v<version>/install.sh` installs that version.
+
+Then run `t2`. That's it! The app will guide you through the API key setup on first run.
+
+### Install somewhere else
+
+Set `T2_INSTALL_DIR` to the folder to install into:
 
 ```sh
 $ curl -fsSL https://github.com/bezmoradi/t2/releases/latest/download/install.sh | T2_INSTALL_DIR="$HOME/bin" sh
 ```
 
-If anything fails, it stops with one line and leaves the folder as it was. On Linux it then warns about each [run-time tool](#linux) that isn't installed, with the package to install. If the folder isn't on your `PATH`, it prints the line to add to your shell's profile. Run the same command again to update; when a newer version is out, t2 prints the command at startup.
+### Update
+
+Run the same command again. When a newer release is out, `t2` says so at startup and prints the command that updates the `t2` in the folder it runs from, and the `go install` command for that release.
+
+To check, `t2` asks `https://api.github.com/repos/bezmoradi/t2/releases/latest` for the latest release in the background, sending only `t2/<version>` as the User-Agent. Set `T2_NO_UPDATE_CHECK=1` to turn the check off; it is off when `CI` or `GITHUB_ACTIONS` is set.
+
+### Check the script first
 
 To check the script before you run it, download it and verify that this repository's release workflow built it (with a signed-in [`gh`](https://cli.github.com)):
 
@@ -51,11 +76,9 @@ $ gh attestation verify install.sh -R bezmoradi/t2 --signer-workflow bezmoradi/t
 $ sh install.sh
 ```
 
-Then run `t2`. That's it! The app will guide you through the API key setup on first run.
+### Other ways to install
 
-### With Go
-
-You can also build and install t2 with Go:
+You can build and install t2 with Go:
 
 ```sh
 $ go install github.com/bezmoradi/t2/cmd/t2@latest
@@ -97,6 +120,8 @@ $ echo $SHELL
 ```
 
 That will tell you whether you’re in `zsh`, `bash`, or another shell. Update the correct configuration file accordingly.
+
+To build from source, see [Building from Source](#building-from-source).
 
 ## Prerequisites
 
@@ -200,7 +225,7 @@ Clone the repository by running the following command:
 $ git clone git@github.com:bezmoradi/t2.git
 ```
 
-Then CD into the `t2` folder and build the app (the same command on macOS and Linux; it needs what [With Go](#with-go) lists):
+Then CD into the `t2` folder and build the app (the same command on macOS and Linux; it needs what [Other ways to install](#other-ways-to-install) lists):
 
 ```sh
 $ go build -o t2 ./cmd/t2/
@@ -212,7 +237,7 @@ Finally, run the app by the following command:
 $ ./t2
 ```
 
-To build a release locally into `dist`, from a clean checkout on macOS (the darwin builds need cgo; linux builds without it anywhere), run `scripts/release.sh <version>`, with the version `internal/version/version.go` sets, without its `v`. It writes the four archives, `install.sh` and `SHA256SUMS`. A `v*` tag on main that matches that version makes `.github/workflows/release.yml` build, check, sign and draft the release; the owner publishes it.
+To build a release locally into `dist`, from a clean checkout on macOS (the darwin builds need cgo; linux builds without it anywhere), run `scripts/release.sh <version>`, with the version `internal/version/version.go` sets, without its `v`. It writes the four archives, `install.sh` and `SHA256SUMS`.
 
 ### API Key Priority System
 
@@ -223,6 +248,26 @@ Your API key is read in this order:
 3. Interactive prompt (first-time setup), whose answer is saved to that file
 
 No `.env` file is read.
+
+### Releasing
+
+Only the owner (`bezmoradi`) can release: `.github/workflows/release.yml` refuses a tag pushed by anyone else, one not on main, or one that isn't the version `internal/version/version.go` sets.
+
+1. Set `VERSION` in `internal/version/version.go` to the new version, `vX.Y.Z`, and merge that to main. Versions up to v1.3.1 read that line on main for their update check, so they announce the new version from the merge on, before its release exists.
+2. Tag main and push the tag:
+
+    ```sh
+    $ git fetch origin && git tag -a vX.Y.Z -m "T2 X.Y.Z" origin/main && git push origin vX.Y.Z
+    ```
+
+3. Watch the release workflow, which builds, checks and signs the release and drafts it:
+
+    ```sh
+    $ gh run watch "$(gh run list --workflow release.yml --limit 1 --json databaseId --jq '.[0].databaseId')"
+    ```
+
+4. Check the draft: `gh release view vX.Y.Z` lists the four archives, the NOTICES file, `install.sh` and `SHA256SUMS`.
+5. Publish it: `gh release edit vX.Y.Z --draft=false`, or on the releases page. From then on the one-command install installs it and older versions announce it.
 
 ## Supported Platforms
 

@@ -281,6 +281,12 @@ jobs:
           curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/install.sh | sh
           ${fence}
 
+          Or, with Go (and on macOS the Xcode Command Line Tools, since the darwin build needs cgo):
+
+          ${fence}bash
+          go install github.com/bezmoradi/t2/cmd/t2@$TAG
+          ${fence}
+
           The script checks the archive for your platform against the SHA-256 it carries and the archive's own \`SHA256SUMS\`. On Linux it warns about the run-time tools t2 needs that aren't installed. To check the script first, download it, run \`gh attestation verify install.sh -R $GITHUB_REPOSITORY --signer-workflow $GITHUB_REPOSITORY/.github/workflows/release.yml --source-ref refs/tags/$TAG\`, then \`sh install.sh\`. Or download and check an archive yourself:
 
           ${fence}bash

@@ -1,53 +1,99 @@
 package version
 
 import (
+	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
-	"regexp"
+	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"golang.org/x/mod/semver"
+
+	"github.com/bezmoradi/t2/internal/transcription"
 )
 
-const versionURL = "https://raw.githubusercontent.com/bezmoradi/t2/main/internal/version/version.go"
+const latestReleaseURL = "https://api.github.com/repos/bezmoradi/t2/releases/latest"
 
-var versionCheckClient = &http.Client{Timeout: 5 * time.Second}
+const installScriptURL = "https://github.com/bezmoradi/t2/releases/latest/download/install.sh"
 
-const maxVersionFileBytes = 64 << 10
+const goInstallPath = "github.com/bezmoradi/t2/cmd/t2"
 
-func CheckVersion() (bool, string) {
-	res, err := versionCheckClient.Get(versionURL)
+const maxReleaseResponseBytes = 1 << 20
+
+var updateCheckClient = &http.Client{Timeout: 5 * time.Second}
+
+var updateCheckOptOuts = []string{"T2_NO_UPDATE_CHECK", "CI", "GITHUB_ACTIONS"}
+
+func NotifyIfOutdated(w io.Writer) {
+	if !updateCheckWanted() {
+		return
+	}
+	latest := CheckVersion()
+	if latest == "" {
+		return
+	}
+	notice := fmt.Sprintf("\nT2 %s is available (you have %s). To update:\n  curl -fsSL %s | %ssh\nOr, with Go: go install %s@%s\nSet T2_NO_UPDATE_CHECK=1 to stop this check.\n%s\n",
+		latest, VERSION, installScriptURL, installDirPrefix(), goInstallPath, latest, UpdateMessage)
+	_, _ = io.WriteString(w, notice)
+}
+
+func updateCheckWanted() bool {
+	for _, env := range updateCheckOptOuts {
+		if os.Getenv(env) != "" {
+			return false
+		}
+	}
+	return semver.IsValid(VERSION)
+}
+
+func CheckVersion() string {
+	req, err := http.NewRequest(http.MethodGet, latestReleaseURL, nil)
 	if err != nil {
-		return true, ""
+		return ""
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("User-Agent", "t2/"+VERSION)
+	res, err := updateCheckClient.Do(req)
+	if err != nil {
+		return ""
 	}
 	defer res.Body.Close()
 	if res.StatusCode != http.StatusOK {
-		return true, ""
-	}
-	body, err := io.ReadAll(io.LimitReader(res.Body, maxVersionFileBytes))
-	if err != nil {
-		return true, ""
-	}
-
-	remoteVersion := extractVersion(string(body))
-	remoteVersionUnknown := remoteVersion == ""
-	if remoteVersionUnknown {
-		return true, ""
-	}
-
-	remoteIsNewer := semver.Compare(remoteVersion, VERSION) > 0
-	if remoteIsNewer {
-		return false, remoteVersion
-	}
-
-	return true, ""
-}
-
-func extractVersion(input string) string {
-	re := regexp.MustCompile(`VERSION\s*=\s*"v(\d+\.\d+\.\d+)"`)
-	matches := re.FindStringSubmatch(input)
-	if len(matches) < 2 {
 		return ""
 	}
-	return "v" + matches[1]
+	var release struct {
+		TagName    string `json:"tag_name"`
+		Draft      bool   `json:"draft"`
+		Prerelease bool   `json:"prerelease"`
+	}
+	if err := json.NewDecoder(io.LimitReader(res.Body, maxReleaseResponseBytes)).Decode(&release); err != nil || release.Draft || release.Prerelease {
+		return ""
+	}
+	if !isReleaseTag(release.TagName) || semver.Compare(release.TagName, VERSION) <= 0 {
+		return ""
+	}
+	return release.TagName
+}
+
+func isReleaseTag(tag string) bool {
+	return semver.IsValid(tag) && semver.Canonical(tag) == tag && semver.Prerelease(tag) == ""
+}
+
+func installDirPrefix() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	exe, err = filepath.EvalSymlinks(exe)
+	if err != nil {
+		return ""
+	}
+	dir := filepath.Dir(exe)
+	if !filepath.IsAbs(dir) || transcription.Sanitize(dir) != dir {
+		return ""
+	}
+	return "T2_INSTALL_DIR='" + strings.ReplaceAll(dir, "'", `'\''`) + "' "
 }

@@ -109,6 +109,7 @@ Files are split by build constraint. `*_darwin.go` (cgo where needed) and `*_lin
 - Both darwin archives are built on the one arm64 runner: with `GOARCH=amd64` the go command passes `-arch x86_64` to clang, and the SDK holds both architectures. That avoids depending on GitHub's Intel macOS images. The amd64 program isn't run in CI; the job checks its architecture with `lipo` and that it links AudioToolbox.
 - `MACOSX_DEPLOYMENT_TARGET=13.0` matches Go's own minimum. Without it a cgo build is marked for the runner's macOS version (`vtool -show-build` shows `minos`), and older Macs refuse it.
 - `scripts/install.sh` is a template: `release-install.sh` replaces its `@VERSION@` and `@SHA256_<OS>_<ARCH>@` lines, and the unrendered script stops. It has no test hook: to try a release locally, serve the folder on 127.0.0.1 and run a copy with the base URL changed and `--proto '=https' --tlsv1.2` dropped, installing into a fresh `T2_INSTALL_DIR`.
+- `.github/rulesets/main.json` and `tags.json` are the rulesets applied on GitHub: on main, no deletion or force push, every change through a pull request merged by squash, and the `claude-review` check passing on a branch that is up to date with main, with no bypass; `v*` tags can be created, moved or deleted only by repository admins. Change them on GitHub and here together.
 
 ## Platform status
 
